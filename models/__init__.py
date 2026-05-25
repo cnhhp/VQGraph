@@ -14,6 +14,9 @@ __all__ = [
     "SemanticVectorQuantize",
     "LocalSubgraph",
     "SubgraphExtractor",
+    "NodeRepresentationTokenizer",
+    "NodeTokenRepresentation",
+    "SubgraphTokenizedView",
 ]
 
 
@@ -49,5 +52,20 @@ def __getattr__(name: str):
         return {
             "LocalSubgraph": LocalSubgraph,
             "SubgraphExtractor": SubgraphExtractor,
+        }[name]
+    if name in (
+        "NodeRepresentationTokenizer",
+        "NodeTokenRepresentation",
+        "SubgraphTokenizedView",
+    ):
+        from models.node_representation import (
+            NodeRepresentationTokenizer,
+            NodeTokenRepresentation,
+            SubgraphTokenizedView,
+        )
+        return {
+            "NodeRepresentationTokenizer": NodeRepresentationTokenizer,
+            "NodeTokenRepresentation": NodeTokenRepresentation,
+            "SubgraphTokenizedView": SubgraphTokenizedView,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -352,10 +352,28 @@ class CodebookTrainer:
             node_code_assignments=node_codes,
             save_dir=output_dir,
         )
-        self.save_artifacts(artifacts, output_dir)
+        self.save_artifacts(artifacts, output_dir, train_conf=conf)
         return artifacts
 
-    def save_artifacts(self, artifacts: CodebookArtifacts, save_dir: Path) -> None:
+    @staticmethod
+    def _jsonify_conf(conf: Dict[str, Any]) -> Dict[str, Any]:
+        """将训练 conf 转为可 JSON 序列化的字典。"""
+        out: Dict[str, Any] = {}
+        for key, val in conf.items():
+            if isinstance(val, torch.device):
+                out[key] = str(val)
+            elif isinstance(val, Path):
+                out[key] = str(val)
+            else:
+                out[key] = val
+        return out
+
+    def save_artifacts(
+        self,
+        artifacts: CodebookArtifacts,
+        save_dir: Path,
+        train_conf: Optional[Dict[str, Any]] = None,
+    ) -> None:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(artifacts.encoder_state_dict, save_dir / "model.pth")
@@ -380,6 +398,9 @@ class CodebookTrainer:
         }
         with open(save_dir / "config.json", "w", encoding="utf-8") as f:
             json.dump(cfg_snap, f, indent=2)
+        if train_conf is not None:
+            with open(save_dir / "train_conf.json", "w", encoding="utf-8") as f:
+                json.dump(self._jsonify_conf(train_conf), f, indent=2)
         logger.info("Saved artifacts to %s", save_dir)
 
     @staticmethod

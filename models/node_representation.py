@@ -411,12 +411,21 @@ def _run_smoke_test(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
     texts = [text_dict[i] for i in range(g.num_nodes())]
-    tokenbook = _FixtureTokenbook.from_texts(
-        texts,
-        max_vocab=args.vocab_size,
-        model_name=args.sentence_bert,
-        device=device,
-    )
+    if args.use_fixture_tokenbook:
+        tokenbook = _FixtureTokenbook.from_texts(
+            texts,
+            max_vocab=args.vocab_size,
+            model_name=args.sentence_bert,
+            device=device,
+        )
+        logger.info("Using fixture tokenbook (V=%d)", len(tokenbook))
+    else:
+        tokenbook = TextTokenbook.load(
+            args.tokenbook_dir,
+            model_name=args.sentence_bert,
+            device=device,
+        )
+        logger.info("Using tokenbook from %s (V=%d)", args.tokenbook_dir, len(tokenbook))
 
     text_emb = extract_sentence_bert_embeddings(
         text_dict,
@@ -468,6 +477,8 @@ def _parse_main_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=int, default=0, help="-1 for CPU")
     p.add_argument("--no_tfidf", action="store_true")
+    p.add_argument("--tokenbook_dir", type=str, default="./codebook")
+    p.add_argument("--use_fixture_tokenbook", action="store_true")
     p.add_argument("--vocab_size", type=int, default=512)
     p.add_argument("--sentence_bert", type=str, default="all-MiniLM-L6-v2")
     p.add_argument("--test_fuse_fallback", action="store_true")

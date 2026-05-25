@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval_interval", type=int, default=1)
     p.add_argument("--sentence_bert", type=str, default=None)
     p.add_argument("--compute_tfidf", action="store_true")
+    p.add_argument(
+        "--tokenbook_dir",
+        type=str,
+        default="./codebook",
+        help="预置文本 tokenbook 目录（--compute_tfidf 时使用）",
+    )
     p.add_argument("--console_log", action="store_true")
     return p.parse_args()
 
@@ -133,13 +139,26 @@ def main() -> None:
     )
 
     if args.compute_tfidf:
+        from text_tokenizers.text_tokenbook import TextTokenbook
+
         train_ids = idx_train.cpu().numpy()
         tfidf_path = output_dir / "tfidf_stats.npz"
+        tokenbook = TextTokenbook.load(
+            Path(args.tokenbook_dir),
+            model_name=cfg.sentence_bert_model,
+            device=device,
+        )
         TFIDFComputer(cfg).run_offline(
             artifacts,
             text_dict,
             train_ids,
             tfidf_path,
+            tokenbook=tokenbook,
+        )
+        logger.info(
+            "TF-IDF recomputed with tokenbook vocab (%d tokens). "
+            "Re-run this step after switching tokenbook.",
+            len(tokenbook),
         )
 
     logger.info("Training complete. Artifacts: %s", output_dir)

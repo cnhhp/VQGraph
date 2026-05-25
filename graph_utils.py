@@ -220,6 +220,15 @@ def texts_to_token_ids(
     num_nodes: int,
 ) -> List[List[int]]:
     """将节点文本转为 token id 列表。"""
+    return texts_to_tokenbook_ids(text_dict, token_to_id, num_nodes)
+
+
+def texts_to_tokenbook_ids(
+    text_dict: Dict[int, str],
+    token_to_id: Dict[str, int],
+    num_nodes: int,
+) -> List[List[int]]:
+    """词级分词后，仅保留 tokenbook 词表中存在的 token id。"""
     out: List[List[int]] = []
     for i in range(num_nodes):
         toks = tokenize_for_tfidf(text_dict.get(i, ""))

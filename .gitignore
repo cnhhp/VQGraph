@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 outputs/
+codebook/token_embeddings.npz
+codebook/tokenbook_meta.json

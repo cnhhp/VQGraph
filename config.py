@@ -19,7 +19,10 @@ class Config:
     data_root: Path = field(default_factory=lambda: Path("./data"))
     output_root: Path = field(default_factory=lambda: Path("./outputs"))
     node_text_csv: Optional[Path] = None  # 节点 ID -> 原始文本
-    tokenbook_path: Optional[Path] = None
+    tokenbook_path: Optional[Path] = field(default_factory=lambda: Path("./codebook"))
+    tokenbook_vocab_filename: str = "subword_vocabulary.npy"
+    tokenbook_embeddings_filename: str = "token_embeddings.npz"
+    tokenbook_meta_filename: str = "tokenbook_meta.json"
     codebook_checkpoint_dir: Optional[Path] = None
 
     # ---------- 数据集 ----------

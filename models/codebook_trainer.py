@@ -9,7 +9,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -18,15 +18,15 @@ import torch.optim as optim
 import dgl
 
 from config import Config, get_config
-from graph_utils import (
-    build_tfidf_vocab,
-    texts_to_token_ids,
-)
+from graph_utils import texts_to_tokenbook_ids
 from models._root_bridge import load_root_models_module
 from models.semantic_vq import SemanticVectorQuantize
 from utils import get_evaluator, get_training_config
 
 Model = load_root_models_module().Model
+
+if TYPE_CHECKING:
+    from text_tokenizers.text_tokenbook import TextTokenbook
 
 logger = logging.getLogger(__name__)
 
@@ -526,17 +526,16 @@ class TFIDFComputer:
         text_dict: Dict[int, str],
         train_node_ids: np.ndarray,
         save_path: Path,
-        max_vocab: Optional[int] = None,
+        tokenbook: TextTokenbook,
     ) -> TFIDFStatistics:
         save_path = Path(save_path)
-        max_vocab = max_vocab or self.cfg.text_vocab_size
         num_codes = artifacts.codebook_embeddings.shape[0]
-
-        train_texts = [text_dict[int(i)] for i in train_node_ids]
-        token_to_id, id_to_token = build_tfidf_vocab(train_texts, max_vocab=max_vocab)
+        token_to_id = tokenbook.token_to_id
         vocab_size = len(token_to_id)
+        if vocab_size == 0:
+            raise ValueError("Tokenbook vocabulary is empty.")
 
-        all_ids = texts_to_token_ids(
+        all_ids = texts_to_tokenbook_ids(
             text_dict, token_to_id, num_nodes=len(text_dict)
         )
         node_codes = artifacts.node_code_assignments
@@ -565,7 +564,7 @@ class TFIDFComputer:
         with open(vocab_path, "w", encoding="utf-8") as f:
             json.dump(token_to_id, f, ensure_ascii=False, indent=0)
         logger.info(
-            "Saved TF-IDF to %s shape (%d, %d)",
+            "Saved TF-IDF (tokenbook vocab) to %s shape (%d, %d)",
             save_path,
             stats.num_codes,
             stats.vocab_size,

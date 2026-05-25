@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", type=str, default="cora")
     p.add_argument("--data_root", type=str, default="./data")
     p.add_argument("--codebook_dir", type=str, required=True, help="模块1 产物目录")
-    p.add_argument("--tokenbook_path", type=str, required=True)
+    p.add_argument("--tokenbook_path", type=str, default="./codebook")
     p.add_argument("--tfidf_path", type=str, default=None)
     p.add_argument("--output_dir", type=str, default="./data/llm_finetune")
     p.add_argument("--splits", nargs="+", default=["train", "val", "test"])
@@ -66,7 +66,8 @@ def main() -> None:
     _, edge_index, labels, train_mask, val_mask, test_mask, _ = bundle
 
     # artifacts = StructuralCodebookTrainer.load_artifacts(...)
-    # tokenbook = TextTokenbook().load(cfg.tokenbook_path)
+    tokenbook = TextTokenbook.load(cfg.tokenbook_path)
+    logger.info("Loaded tokenbook: V=%d", len(tokenbook))
     # tfidf = TFIDFComputer.load(...) if args.tfidf_path else None
 
     split_masks = {

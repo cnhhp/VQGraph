@@ -34,6 +34,78 @@ from text_tokenizers.text_tokenbook import TextTokenbook  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def select_diverse_tokens(
+    scores: np.ndarray,
+    token_embeddings: torch.Tensor,
+    k: int,
+    mmr_lambda: float = 0.5,
+    candidate_pool: Optional[int] = None,
+) -> List[int]:
+    """
+    用 MMR 从 scores 中选出 k 个既相关又互不重复的 token id。
+
+    MMR(t) = λ·rel(t) − (1−λ)·max_{s∈S} div_sim(t, s)
+    - rel(t): 候选池内 scores 的 min-max 归一化
+    - div_sim: token 嵌入余弦相似度，映射到 [0, 1]
+
+    第 1 个为 score 最高者；后续按 MMR 贪心选取。返回顺序为选取顺序。
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    vocab_size = scores.shape[0]
+    if k <= 0 or vocab_size == 0:
+        return []
+
+    k = min(k, vocab_size)
+    pool_size = candidate_pool if candidate_pool is not None else max(2 * k, 64)
+    pool_size = min(pool_size, vocab_size)
+
+    pool_ids = np.argpartition(-scores, pool_size - 1)[:pool_size]
+    if pool_ids.size == 0:
+        return []
+
+    pool_scores = scores[pool_ids]
+    if k >= pool_ids.size:
+        order = np.argsort(-pool_scores)
+        return [int(pool_ids[i]) for i in order[:k]]
+
+    score_min = float(pool_scores.min())
+    score_max = float(pool_scores.max())
+    if score_max - score_min < 1e-12:
+        rel = np.ones_like(pool_scores)
+    else:
+        rel = (pool_scores - score_min) / (score_max - score_min)
+
+    emb = token_embeddings.float()
+    if emb.device.type != "cpu":
+        emb = emb.cpu()
+    pool_emb = F.normalize(emb[pool_ids], dim=1)
+    div_sim = (pool_emb @ pool_emb.T).clamp(-1.0, 1.0)
+    div_sim = (div_sim + 1.0) / 2.0
+
+    lam = float(np.clip(mmr_lambda, 1e-6, 1.0))
+    first_local = int(np.argmax(pool_scores))
+    selected_local: List[int] = [first_local]
+    selected_set = {first_local}
+
+    while len(selected_local) < k:
+        best_mmr = -np.inf
+        best_local = -1
+        for i in range(pool_ids.size):
+            if i in selected_set:
+                continue
+            max_div = float(div_sim[i, selected_local].max().item())
+            mmr = lam * rel[i] - (1.0 - lam) * max_div
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best_local = i
+        if best_local < 0:
+            break
+        selected_local.append(best_local)
+        selected_set.add(best_local)
+
+    return [int(pool_ids[i]) for i in selected_local]
+
+
 @dataclass
 class NodeTokenRepresentation:
     """单节点联合离散表示。"""
@@ -69,6 +141,7 @@ class NodeRepresentationTokenizer:
 
     文本筛选::
         score[t] = text_sim[t] * (1 + λ_tfidf * TF-IDF_norm[c][t])
+        再用 MMR（select_diverse_tokens）从 scores 中选出 K 个多样 token。
     未见结构码时退化为纯 text_sim。
     """
 
@@ -273,7 +346,7 @@ class NodeRepresentationTokenizer:
         top_k: Optional[int] = None,
     ) -> Tuple[List[str], List[int]]:
         """
-        结构引导的 Top-K 文本 token 选取。
+        结构引导 + MMR 的 K 个文本 token 选取（scores 含 TF-IDF 融合）。
 
         Returns
         -------
@@ -288,8 +361,14 @@ class NodeRepresentationTokenizer:
         scores = self._fuse_scores(text_sim, struct_code_idx)
         k = min(k, vocab_size)
 
-        top_ids = np.argpartition(-scores, k - 1)[:k]
-        top_ids = top_ids[np.argsort(-scores[top_ids])]
+        book_emb = self.tokenbook.get_embedding_matrix()
+        top_ids = select_diverse_tokens(
+            scores,
+            book_emb,
+            k=k,
+            mmr_lambda=self.cfg.mmr_lambda,
+            candidate_pool=self.cfg.mmr_candidate_pool,
+        )
 
         id_to_token = self.tokenbook.id_to_token
         tokens = [id_to_token[int(i)] for i in top_ids if int(i) in id_to_token]

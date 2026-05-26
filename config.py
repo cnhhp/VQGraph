@@ -50,6 +50,8 @@ class Config:
     text_vocab_size: int = 13648  # V（filtered_tokenbook.npy）
     top_k_text_tokens: int = 5  # K
     lambda_tfidf: float = 0.5
+    mmr_lambda: float = 0.5  # MMR 相关性权重，越大越偏向高分 token
+    mmr_candidate_pool: int = 64  # MMR 前按 score 保留的候选数
     struct_token_prefix: str = "<S_"
 
     # ---------- 模块4：序列化 ----------

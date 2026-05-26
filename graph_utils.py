@@ -18,6 +18,33 @@ from config import Config, get_config
 
 logger = logging.getLogger(__name__)
 
+# 引文网络常用类别名（与 CPF .npz 中 class 顺序一致）
+DATASET_CLASS_NAMES: Dict[str, List[str]] = {
+    "cora": [
+        "Case_Based",
+        "Genetic_Algorithms",
+        "Neural_Networks",
+        "Probabilistic_Methods",
+        "Reinforcement_Learning",
+        "Rule_Learning",
+        "Theory",
+    ],
+    "citeseer": [
+        "Agents",
+        "AI",
+        "DB",
+        "IR",
+        "ML",
+        "HCI",
+        "RT",
+    ],
+    "pubmed": [
+        "Diabetes_Mellitus_Experimental",
+        "Diabetes_Mellitus_Type_1",
+        "Diabetes_Mellitus_Type_2",
+    ],
+}
+
 GraphDataBundle = Tuple[
     Any,  # DGL graph g
     torch.Tensor,  # feats [N, F]
@@ -27,6 +54,15 @@ GraphDataBundle = Tuple[
     torch.Tensor,  # idx_test
     Dict[int, str],  # node_id -> raw text
 ]
+
+
+def resolve_class_name(dataset_name: str, label_idx: int) -> str:
+    """将整数类别索引转为可读类名；未知数据集回退为 Class_{idx}。"""
+    names = DATASET_CLASS_NAMES.get(dataset_name.lower())
+    idx = int(label_idx)
+    if names is not None and 0 <= idx < len(names):
+        return names[idx]
+    return f"Class_{idx}"
 
 
 def get_device(cfg: Optional[Config] = None) -> torch.device:

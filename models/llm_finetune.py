@@ -50,11 +50,34 @@ class InstructionDatasetBuilder:
 
     @staticmethod
     def load_jsonl(path: Path) -> List[InstructionSample]:
-        raise NotImplementedError
+        import json
+
+        samples: List[InstructionSample] = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                samples.append(
+                    InstructionSample(
+                        instruction=obj["instruction"],
+                        input=obj["input"],
+                        output=obj["output"],
+                    )
+                )
+        return samples
 
     @staticmethod
     def save_jsonl(samples: List[InstructionSample], path: Path) -> None:
-        raise NotImplementedError
+        import json
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for sample in samples:
+                f.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
+        logger.info("Wrote %d samples to %s", len(samples), path)
 
     def build_prompt(self, sample: InstructionSample) -> str:
         """拼接 instruction + input 为模型输入。"""

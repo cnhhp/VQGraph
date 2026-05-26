@@ -20,7 +20,7 @@ class Config:
     output_root: Path = field(default_factory=lambda: Path("./outputs"))
     node_text_csv: Optional[Path] = None  # 节点 ID -> 原始文本
     tokenbook_path: Optional[Path] = field(default_factory=lambda: Path("./codebook"))
-    tokenbook_vocab_filename: str = "subword_vocabulary.npy"
+    tokenbook_vocab_filename: str = "filtered_tokenbook.npy"
     tokenbook_embeddings_filename: str = "token_embeddings.npz"
     tokenbook_meta_filename: str = "tokenbook_meta.json"
     codebook_checkpoint_dir: Optional[Path] = None
@@ -47,7 +47,7 @@ class Config:
     max_subgraph_nodes: Optional[int] = None  # None 表示不截断
 
     # ---------- 模块3：节点离散化 ----------
-    text_vocab_size: int = 15062  # V
+    text_vocab_size: int = 13648  # V（filtered_tokenbook.npy）
     top_k_text_tokens: int = 5  # K
     lambda_tfidf: float = 0.5
     struct_token_prefix: str = "<S_"

@@ -1,7 +1,7 @@
 """
 文本 tokenbook 加载与嵌入缓存。
 
-从预置 ``codebook/subword_vocabulary.npy`` 加载词表，并用 Sentence-BERT 编码 / 缓存嵌入矩阵。
+从预置 ``codebook/filtered_tokenbook.npy`` 加载词表，并用 Sentence-BERT 编码 / 缓存嵌入矩阵。
 供模块3 结构引导文本 token 筛选使用。
 """
 
@@ -64,7 +64,7 @@ class TextTokenbook:
         从目录或 ``.npy`` 词表文件加载 tokenbook。
 
         目录内默认文件：
-        - ``subword_vocabulary.npy``：词表
+        - ``filtered_tokenbook.npy``：词表
         - ``token_embeddings.npz``：可选 SBERT 嵌入缓存
         - ``tokenbook_meta.json``：缓存元数据
         """
@@ -158,7 +158,7 @@ class TextTokenbookBuilder:
         embedding_model: Optional[str] = None,
     ) -> TextTokenbook:
         raise NotImplementedError(
-            "TextTokenbook 使用预置 codebook/subword_vocabulary.npy；"
+            "TextTokenbook 使用预置 codebook/filtered_tokenbook.npy；"
             "请调用 TextTokenbook.load('./codebook') 而非从语料构建词表。"
         )
 
@@ -199,6 +199,8 @@ class TextTokenbookBuilder:
                         meta.get("model_name") == model_name
                         and meta.get("vocab_size") == vocab_size
                         and meta.get("embedding_dim") == emb.shape[1]
+                        and meta.get("vocab_filename")
+                        == self.cfg.tokenbook_vocab_filename
                     )
                     if not meta_ok:
                         logger.warning(

@@ -200,7 +200,7 @@ def tokenize_for_tfidf(text: str) -> List[str]:
 
 def build_tfidf_vocab(
     texts: List[str],
-    max_vocab: int = 15062,
+    max_vocab: int = 13648,
 ) -> Tuple[Dict[str, int], Dict[int, str]]:
     """从文本列表构建词表 word -> id。"""
     from collections import Counter

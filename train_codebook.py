@@ -55,10 +55,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sentence_bert", type=str, default=None)
     p.add_argument("--compute_tfidf", action="store_true")
     p.add_argument(
+        "--tfidf_only",
+        action="store_true",
+        help="仅重算 TF-IDF（加载已有码本产物，不重新训练）",
+    )
+    p.add_argument(
         "--tokenbook_dir",
         type=str,
         default="./codebook",
-        help="预置文本 tokenbook 目录（--compute_tfidf 时使用）",
+        help="预置文本 tokenbook 目录（--compute_tfidf / --tfidf_only 时使用）",
     )
     p.add_argument("--console_log", action="store_true")
     return p.parse_args()
@@ -84,7 +89,7 @@ def main() -> None:
 
     set_seed(args.seed)
     output_dir = Path(args.output_dir) / args.dataset / args.teacher / f"seed_{args.seed}"
-    check_writable(output_dir, overwrite=False)
+    check_writable(output_dir, overwrite=args.tfidf_only)
     setup_logging(__name__, log_file=output_dir / "train_codebook.log")
     if args.console_log:
         logging.getLogger(__name__).setLevel(logging.INFO)
@@ -105,40 +110,48 @@ def main() -> None:
         labelrate_val=args.labelrate_val,
     )
 
-    logger.info("Extracting Sentence-BERT embeddings...")
-    text_emb = extract_sentence_bert_embeddings(
-        text_dict,
-        model_name=cfg.sentence_bert_model,
-        device=device,
-    )
+    if args.tfidf_only:
+        if not (output_dir / "model.pth").exists():
+            raise FileNotFoundError(
+                f"No trained codebook at {output_dir}; run training first or drop --tfidf_only."
+            )
+        artifacts = CodebookTrainer.load_artifacts(output_dir, device)
+        logger.info("Loaded artifacts from %s (tfidf_only mode)", output_dir)
+    else:
+        logger.info("Extracting Sentence-BERT embeddings...")
+        text_emb = extract_sentence_bert_embeddings(
+            text_dict,
+            model_name=cfg.sentence_bert_model,
+            device=device,
+        )
 
-    conf = CodebookTrainer.build_conf_from_args(
-        args,
-        feat_dim=feats.shape[1],
-        label_dim=int(labels.max().item()) + 1,
-        device=device,
-    )
-    conf["lamb_node"] = args.lamb_node
-    conf["lamb_edge"] = args.lamb_edge
-    conf["patience"] = args.patience
-    conf["seed"] = args.seed
-    conf["dataset"] = args.dataset
+        conf = CodebookTrainer.build_conf_from_args(
+            args,
+            feat_dim=feats.shape[1],
+            label_dim=int(labels.max().item()) + 1,
+            device=device,
+        )
+        conf["lamb_node"] = args.lamb_node
+        conf["lamb_edge"] = args.lamb_edge
+        conf["patience"] = args.patience
+        conf["seed"] = args.seed
+        conf["dataset"] = args.dataset
 
-    trainer = CodebookTrainer(cfg)
-    artifacts = trainer.fit(
-        g=g,
-        feats=feats,
-        labels=labels,
-        text_embeddings=text_emb,
-        idx_train=idx_train,
-        idx_val=idx_val,
-        idx_test=idx_test,
-        conf=conf,
-        output_dir=output_dir,
-        logger_inst=logger,
-    )
+        trainer = CodebookTrainer(cfg)
+        artifacts = trainer.fit(
+            g=g,
+            feats=feats,
+            labels=labels,
+            text_embeddings=text_emb,
+            idx_train=idx_train,
+            idx_val=idx_val,
+            idx_test=idx_test,
+            conf=conf,
+            output_dir=output_dir,
+            logger_inst=logger,
+        )
 
-    if args.compute_tfidf:
+    if args.compute_tfidf or args.tfidf_only:
         from text_tokenizers.text_tokenbook import TextTokenbook
 
         train_ids = idx_train.cpu().numpy()
@@ -147,6 +160,7 @@ def main() -> None:
             Path(args.tokenbook_dir),
             model_name=cfg.sentence_bert_model,
             device=device,
+            build_embeddings=False,
         )
         TFIDFComputer(cfg).run_offline(
             artifacts,
@@ -161,7 +175,10 @@ def main() -> None:
             len(tokenbook),
         )
 
-    logger.info("Training complete. Artifacts: %s", output_dir)
+    if args.tfidf_only:
+        logger.info("TF-IDF recompute complete. Artifacts: %s", output_dir)
+    else:
+        logger.info("Training complete. Artifacts: %s", output_dir)
 
 
 if __name__ == "__main__":

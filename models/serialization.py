@@ -514,10 +514,14 @@ def _run_smoke_test(args: argparse.Namespace) -> None:
 
     from text_tokenizers.text_tokenbook import TextTokenbook
 
+    data_source = getattr(args, "data_source", None)
+    if data_source == "auto":
+        data_source = None
     g, feats, _, _, _, _, text_dict = load_graph_data(
         args.dataset,
         root=args.data_root,
         seed=args.seed,
+        data_source=data_source,
     )
 
     tokenbook = TextTokenbook.load(
@@ -596,6 +600,13 @@ def _parse_main_args() -> argparse.Namespace:
     p.add_argument("--tokenbook_dir", type=str, default="./codebook")
     p.add_argument("--dataset", type=str, default="cora")
     p.add_argument("--data_root", type=str, default="./data")
+    p.add_argument(
+        "--data_source",
+        type=str,
+        default=None,
+        choices=["auto", "text", "cpf"],
+        help="数据来源：auto=优先 data/dataset/{name}/",
+    )
     p.add_argument("--node", type=int, default=0)
     p.add_argument("--k", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)

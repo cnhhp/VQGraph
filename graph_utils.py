@@ -6,6 +6,7 @@ Pipeline 通用工具（对应 prompt.md 中的 utils.py 约定）。
 from __future__ import annotations
 
 import logging
+import pickle
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -63,6 +64,123 @@ def resolve_class_name(dataset_name: str, label_idx: int) -> str:
     if names is not None and 0 <= idx < len(names):
         return names[idx]
     return f"Class_{idx}"
+
+
+def format_category_display_name(raw: str) -> str:
+    """将 'neural networks' 规范为 JSON 友好类名 'Neural_Networks'。"""
+    parts = re.split(r"[\s_]+", str(raw).strip())
+    return "_".join(p.capitalize() for p in parts if p)
+
+
+def resolve_node_class_name(
+    dataset_name: str,
+    node_id: int,
+    labels: torch.Tensor,
+    graph: Any,
+) -> str:
+    """
+    解析节点类别名：优先 g.ndata['category_name']（文本 DGL 数据集），
+    否则回退 CPF 的 label 索引映射。
+    """
+    cat_names = getattr(graph, "category_names", None)
+    if cat_names is not None:
+        raw = cat_names[node_id]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        return format_category_display_name(str(raw))
+    if "category_name" in getattr(graph, "ndata", {}):
+        raw = graph.ndata["category_name"][node_id]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        return format_category_display_name(str(raw))
+    label_idx = int(labels[node_id].item())
+    return resolve_class_name(dataset_name, label_idx)
+
+
+def text_dgl_dataset_dir(
+    root: Union[str, Path],
+    dataset_name: str,
+    text_dataset_subdir: str = "dataset",
+) -> Optional[Path]:
+    """若存在 {root}/{subdir}/{name}/{name}_graph.pth 则返回该目录。"""
+    d = Path(root) / text_dataset_subdir / dataset_name
+    if (d / f"{dataset_name}_graph.pth").exists():
+        return d
+    return None
+
+
+def _load_text_dgl_metadata(dataset_dir: Path, dataset_name: str) -> Dict[str, Any]:
+    """加载 metadata，兼容 .pth / .pt。"""
+    for suffix in (".pth", ".pt"):
+        path = dataset_dir / f"{dataset_name}_metadata{suffix}"
+        if path.exists():
+            return torch.load(path, map_location="cpu")
+    return {}
+
+
+def load_text_dgl_dataset(
+    dataset_name: str,
+    dataset_dir: Path,
+) -> GraphDataBundle:
+    """
+    加载 data/dataset/{name}/ 下的 DGL 图 + 文本 + 划分。
+
+    期望文件：{name}_graph.pth、{name}_text.pkl（可选）、{name}_metadata.pth|.pt
+    """
+    dataset_dir = Path(dataset_dir)
+    graph_path = dataset_dir / f"{dataset_name}_graph.pth"
+    g = torch.load(graph_path, map_location="cpu")
+    n = g.num_nodes()
+
+    text_dict: Dict[int, str] = {}
+    text_pkl = dataset_dir / f"{dataset_name}_text.pkl"
+    if text_pkl.exists():
+        with open(text_pkl, "rb") as f:
+            texts = pickle.load(f)
+        if isinstance(texts, dict):
+            text_dict = {int(k): str(v) for k, v in texts.items()}
+        elif isinstance(texts, (list, tuple)):
+            text_dict = {i: str(texts[i]) for i in range(len(texts))}
+        else:
+            raise ValueError(f"Unsupported text format in {text_pkl}: {type(texts)}")
+        logger.info("Loaded node text from %s (%d entries)", text_pkl, len(text_dict))
+    else:
+        logger.warning("No %s_text.pkl; node text will be empty unless CSV override.", dataset_name)
+
+    meta = _load_text_dgl_metadata(dataset_dir, dataset_name)
+    categories = meta.get("categories")
+    if categories is not None:
+        # 字符串类名无法存入 ndata tensor，挂到图对象上
+        g.category_names = np.asarray(categories)
+
+    feats = g.ndata["feat"]
+    labels = g.ndata["label"].long()
+
+    def _mask_to_idx(mask_key: str) -> torch.Tensor:
+        if mask_key not in g.ndata:
+            raise KeyError(f"Graph missing ndata['{mask_key}'] for text DGL split")
+        mask = g.ndata[mask_key].bool()
+        return torch.where(mask)[0].long()
+
+    idx_train = _mask_to_idx("train_mask")
+    idx_val = _mask_to_idx("val_mask")
+    idx_test = _mask_to_idx("test_mask")
+
+    for i in range(n):
+        if i not in text_dict:
+            text_dict[i] = f"node_{i}"
+
+    logger.info(
+        "Text DGL dataset %s: nodes=%d edges=%d feat_dim=%d train=%d val=%d test=%d",
+        dataset_name,
+        n,
+        g.num_edges(),
+        feats.shape[1],
+        len(idx_train),
+        len(idx_val),
+        len(idx_test),
+    )
+    return g, feats, labels, idx_train, idx_val, idx_test, text_dict
 
 
 def get_device(cfg: Optional[Config] = None) -> torch.device:
@@ -130,46 +248,85 @@ def load_graph_data(
     labelrate_train: int = 20,
     labelrate_val: int = 30,
     split_idx: int = 0,
+    data_source: Optional[str] = None,
+    text_dataset_subdir: str = "dataset",
 ) -> GraphDataBundle:
     """
-    通过现有 DGL dataloader 加载图，并解析节点文本。
+    加载图数据与节点文本。
+
+    data_source:
+    - None / "auto": 若存在 data/dataset/{name}/{name}_graph.pth 则用文本 DGL 版，否则 CPF .npz
+    - "text": 强制文本 DGL
+    - "cpf": 强制 CPF dataloader
 
     Returns
     -------
     g, feats, labels, idx_train, idx_val, idx_test, text_dict
     """
-    from dataloader import load_data
+    root = Path(root)
+    source = (data_source or "auto").lower()
+    text_dir = text_dgl_dataset_dir(root, dataset_name, text_dataset_subdir)
 
-    g, labels, idx_train, idx_val, idx_test = load_data(
-        dataset_name,
-        str(root),
-        split_idx=split_idx,
-        seed=seed,
-        labelrate_train=labelrate_train,
-        labelrate_val=labelrate_val,
-    )
-    feats = g.ndata["feat"]
-
-    text_dict: Dict[int, str] = {}
-    if node_text_path is not None:
-        text_dict = load_raw_text(node_text_path)
-        logger.info("Loaded node text from %s (%d entries)", node_text_path, len(text_dict))
-    else:
-        meta = g.ndata.get("text") or g.ndata.get("raw_text")
-        if meta is not None:
-            for i in range(g.num_nodes()):
-                t = meta[i]
-                if isinstance(t, bytes):
-                    t = t.decode("utf-8", errors="ignore")
-                text_dict[i] = str(t)
-        else:
-            attr_names = getattr(g, "attr_names", None)
-            if attr_names is None and "attr_names" in g.ndata:
-                attr_names = g.ndata["attr_names"]
-            logger.warning(
-                "No node_text_csv; using BoW pseudo-text fallback for semantic embeddings."
+    use_text = False
+    if source in ("text", "text_dgl", "dgl"):
+        if text_dir is None:
+            raise FileNotFoundError(
+                f"data_source=text but no text DGL dataset at "
+                f"{root / text_dataset_subdir / dataset_name}"
             )
-            text_dict = _bow_pseudo_text(feats, attr_names)
+        use_text = True
+    elif source in ("cpf", "npz"):
+        use_text = False
+    elif source in ("auto", "none", ""):
+        use_text = text_dir is not None
+    else:
+        raise ValueError(f"Unknown data_source: {data_source}")
+
+    if use_text:
+        assert text_dir is not None
+        logger.info("Using text DGL dataset from %s", text_dir)
+        g, feats, labels, idx_train, idx_val, idx_test, text_dict = load_text_dgl_dataset(
+            dataset_name, text_dir
+        )
+    else:
+        from dataloader import load_data
+
+        g, labels, idx_train, idx_val, idx_test = load_data(
+            dataset_name,
+            str(root),
+            split_idx=split_idx,
+            seed=seed,
+            labelrate_train=labelrate_train,
+            labelrate_val=labelrate_val,
+        )
+        feats = g.ndata["feat"]
+        text_dict = {}
+
+        if node_text_path is None:
+            meta = g.ndata.get("text") or g.ndata.get("raw_text")
+            if meta is not None:
+                for i in range(g.num_nodes()):
+                    t = meta[i]
+                    if isinstance(t, bytes):
+                        t = t.decode("utf-8", errors="ignore")
+                    text_dict[i] = str(t)
+            else:
+                attr_names = getattr(g, "attr_names", None)
+                if attr_names is None and "attr_names" in g.ndata:
+                    attr_names = g.ndata["attr_names"]
+                logger.warning(
+                    "No node_text_csv; using BoW pseudo-text fallback for semantic embeddings."
+                )
+                text_dict = _bow_pseudo_text(feats, attr_names)
+
+    if node_text_path is not None:
+        overrides = load_raw_text(node_text_path)
+        text_dict.update(overrides)
+        logger.info(
+            "Applied node text overrides from %s (%d entries)",
+            node_text_path,
+            len(overrides),
+        )
 
     n = g.num_nodes()
     for i in range(n):
@@ -227,6 +384,64 @@ def edge_index_from_dgl(g: Any) -> torch.Tensor:
     """从 DGL 图导出 edge_index [2, E]。"""
     src, dst = g.edges()
     return torch.stack([src, dst], dim=0).long()
+
+
+# 选词阶段过滤用（词表本身不改动）
+ENGLISH_STOPWORDS: frozenset = frozenset(
+    {
+        "a", "an", "the", "and", "or", "but", "if", "then", "else", "when",
+        "at", "by", "for", "with", "about", "against", "between", "into",
+        "through", "during", "before", "after", "above", "below", "to", "from",
+        "up", "down", "in", "out", "on", "off", "over", "under", "again",
+        "further", "once", "here", "there", "all", "any", "both", "each",
+        "few", "more", "most", "other", "some", "such", "no", "nor", "not",
+        "only", "own", "same", "so", "than", "too", "very", "can", "will",
+        "just", "should", "now", "is", "are", "was", "were", "be", "been",
+        "being", "have", "has", "had", "do", "does", "did", "doing", "would",
+        "could", "ought", "i", "you", "he", "she", "it", "we", "they", "them",
+        "their", "this", "that", "these", "those", "am", "as", "of", "which",
+        "who", "whom", "what", "whose", "where", "why", "how", "because",
+        "while", "although", "though", "until", "unless", "since", "via",
+        # cora_text.pkl 模板字段
+        "title", "abstract",
+    }
+)
+
+
+def is_stopword(token: str) -> bool:
+    """判断 token 是否在选词停用词表中（小写、纯字母）。"""
+    w = str(token).lower().strip()
+    if not w or not w.isalpha():
+        return True
+    if len(w) <= 1:
+        return True
+    return w in ENGLISH_STOPWORDS
+
+
+_STOPWORD_SCORE_PENALTY = -1e12  # 勿用 -inf：argpartition(-scores) 会将其误选为最大
+
+
+def mask_stopwords_in_scores(
+    scores: np.ndarray,
+    id_to_token: Dict[int, str],
+) -> Tuple[np.ndarray, int]:
+    """
+    将停用词对应位置的 score 置为极低分，供 MMR/Top-K 选词使用（词表不变）。
+
+    Returns
+    -------
+    masked_scores, num_masked
+    """
+    masked = np.asarray(scores, dtype=np.float64).copy()
+    n_masked = 0
+    for tid, tok in id_to_token.items():
+        idx = int(tid)
+        if idx < 0 or idx >= masked.shape[0]:
+            continue
+        if is_stopword(tok):
+            masked[idx] = _STOPWORD_SCORE_PENALTY
+            n_masked += 1
+    return masked, n_masked
 
 
 def tokenize_for_tfidf(text: str) -> List[str]:

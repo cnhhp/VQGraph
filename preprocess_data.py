@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,7 +18,7 @@ from config import get_config, reset_config
 from graph_utils import (
     extract_sentence_bert_embeddings,
     load_graph_data,
-    resolve_class_name,
+    resolve_node_class_name,
     set_seed,
     setup_logging,
 )
@@ -57,6 +59,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_tfidf", action="store_true")
     p.add_argument("--max_nodes", type=int, default=None, help="调试用：每个 split 最多处理节点数")
     p.add_argument("--sentence_bert", type=str, default=None)
+    p.add_argument(
+        "--data_source",
+        type=str,
+        default=None,
+        choices=["auto", "text", "cpf"],
+        help="数据来源：auto=优先 data/dataset/{name}/ 文本版",
+    )
+    p.add_argument("--node_text_csv", type=str, default=None, help="可选，覆盖部分节点文本")
     return p.parse_args()
 
 
@@ -155,8 +165,12 @@ def build_sample_for_node(
         pipeline.text_embeddings,
     )
 
-    label_idx = int(pipeline.labels[node_id].item())
-    class_name = resolve_class_name(pipeline.dataset_name, label_idx)
+    class_name = resolve_node_class_name(
+        pipeline.dataset_name,
+        node_id,
+        pipeline.labels,
+        pipeline.graph,
+    )
 
     return InstructionSample(
         instruction=pipeline.instruction,
@@ -215,6 +229,10 @@ def main() -> None:
     cfg.tokenbook_path = Path(args.tokenbook_path)
     if args.sentence_bert:
         cfg.sentence_bert_model = args.sentence_bert
+    if args.data_source is not None:
+        cfg.data_source = None if args.data_source == "auto" else args.data_source
+    if args.node_text_csv:
+        cfg.node_text_csv = Path(args.node_text_csv)
 
     set_seed(args.seed)
     out_dir = Path(args.output_dir)
@@ -226,10 +244,13 @@ def main() -> None:
     g, feats, labels, idx_train, idx_val, idx_test, text_dict = load_graph_data(
         cfg.dataset_name,
         root=cfg.data_root,
+        node_text_path=cfg.node_text_csv,
         seed=args.seed,
         labelrate_train=args.labelrate_train,
         labelrate_val=args.labelrate_val,
         split_idx=args.split_idx,
+        data_source=cfg.data_source,
+        text_dataset_subdir=cfg.text_dataset_subdir,
     )
 
     split_indices: Dict[str, List[int]] = {
@@ -240,6 +261,16 @@ def main() -> None:
 
     pipeline = build_pipeline(args, cfg, g, feats, labels, text_dict)
 
+    manifest: Dict[str, Any] = {
+        "dataset": cfg.dataset_name,
+        "data_root": str(cfg.data_root),
+        "codebook_dir": str(args.codebook_dir),
+        "tokenbook_path": str(args.tokenbook_path),
+        "data_source": args.data_source or "auto",
+        "splits": {},
+    }
+    t_all = time.perf_counter()
+
     for split in args.splits:
         if split not in split_indices:
             logger.warning("Unknown split %s, skip.", split)
@@ -248,6 +279,7 @@ def main() -> None:
         node_ids = split_indices[split]
         logger.info("Processing split %s (%d nodes)", split, len(node_ids))
 
+        t0 = time.perf_counter()
         samples = build_samples_for_split(
             split,
             node_ids,
@@ -256,7 +288,25 @@ def main() -> None:
         )
         out_path = out_dir / f"{split}.jsonl"
         InstructionDatasetBuilder.save_jsonl(samples, out_path)
+        elapsed = time.perf_counter() - t0
+        manifest["splits"][split] = {
+            "path": str(out_path),
+            "num_samples": len(samples),
+            "num_nodes_requested": len(node_ids),
+            "elapsed_sec": round(elapsed, 2),
+        }
+        logger.info(
+            "Split %s finished in %.1fs (%.2f nodes/s)",
+            split,
+            elapsed,
+            len(samples) / elapsed if elapsed > 0 else 0.0,
+        )
 
+    manifest["total_elapsed_sec"] = round(time.perf_counter() - t_all, 2)
+    manifest_path = out_dir / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    logger.info("Wrote manifest to %s", manifest_path)
     logger.info("Done. Output dir: %s", out_dir)
 
 

@@ -66,6 +66,13 @@ def parse_args() -> argparse.Namespace:
         help="预置文本 tokenbook 目录（--compute_tfidf / --tfidf_only 时使用）",
     )
     p.add_argument("--console_log", action="store_true")
+    p.add_argument(
+        "--data_source",
+        type=str,
+        default=None,
+        choices=["auto", "text", "cpf"],
+        help="数据来源：auto=优先 data/dataset/{name}/ 文本版",
+    )
     return p.parse_args()
 
 
@@ -86,6 +93,10 @@ def main() -> None:
         cfg.codebook_train_epochs = args.epochs
     if args.sentence_bert:
         cfg.sentence_bert_model = args.sentence_bert
+    if args.data_source is not None:
+        cfg.data_source = None if args.data_source == "auto" else args.data_source
+    if args.node_text_csv:
+        cfg.node_text_csv = Path(args.node_text_csv)
 
     set_seed(args.seed)
     output_dir = Path(args.output_dir) / args.dataset / args.teacher / f"seed_{args.seed}"
@@ -104,11 +115,26 @@ def main() -> None:
     g, feats, labels, idx_train, idx_val, idx_test, text_dict = load_graph_data(
         args.dataset,
         root=args.data_root,
-        node_text_path=args.node_text_csv,
+        node_text_path=args.node_text_csv or cfg.node_text_csv,
         seed=args.seed,
         labelrate_train=args.labelrate_train,
         labelrate_val=args.labelrate_val,
+        data_source=cfg.data_source,
+        text_dataset_subdir=cfg.text_dataset_subdir,
     )
+    logger.info(
+        "Graph loaded: feat_dim=%d train=%d val=%d test=%d",
+        feats.shape[1],
+        len(idx_train),
+        len(idx_val),
+        len(idx_test),
+    )
+    if feats.shape[1] != 1433 and args.data_source != "cpf":
+        logger.warning(
+            "Node feature dim is %d (text DGL Cora uses 768). "
+            "Retrain codebook if switching from CPF BoW (1433).",
+            feats.shape[1],
+        )
 
     if args.tfidf_only:
         if not (output_dir / "model.pth").exists():

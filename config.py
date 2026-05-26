@@ -27,6 +27,8 @@ class Config:
 
     # ---------- 数据集 ----------
     dataset_name: str = "cora"
+    text_dataset_subdir: str = "dataset"  # 相对 data_root，文本 DGL 数据目录名
+    data_source: Optional[str] = None  # None=auto；text / cpf 强制来源
     sentence_bert_model: str = "all-MiniLM-L6-v2"
 
     # ---------- 模块1：结构码本 ----------
@@ -52,6 +54,7 @@ class Config:
     lambda_tfidf: float = 0.5
     mmr_lambda: float = 0.5  # MMR 相关性权重，越大越偏向高分 token
     mmr_candidate_pool: int = 64  # MMR 前按 score 保留的候选数
+    filter_stopwords_at_selection: bool = True  # 选词时屏蔽停用词（词表不变）
     struct_token_prefix: str = "<S_"
 
     # ---------- 模块4：序列化 ----------
@@ -77,6 +80,10 @@ class Config:
     warmup_ratio: float = 0.03
     max_seq_length: int = 512
     finetune_seed: int = 42
+    qlora_val_acc_threshold: float = 0.0  # QLoRA 最低 val 准确率；0 表示不阻断
+    finetune_eval_batch_size: int = 4
+    use_bf16: bool = True  # CUDA 可用时启用；CPU 自动关闭
+    max_new_tokens: int = 32  # 推理生成长度（类名较短）
 
     # ---------- 通用 ----------
     seed: int = 42

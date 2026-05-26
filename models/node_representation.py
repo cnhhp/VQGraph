@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import Config, get_config
+from graph_utils import mask_stopwords_in_scores
 from models.codebook_trainer import (
     CodebookTrainer,
     TFIDFComputer,
@@ -361,9 +362,24 @@ class NodeRepresentationTokenizer:
         scores = self._fuse_scores(text_sim, struct_code_idx)
         k = min(k, vocab_size)
 
+        selection_scores = scores
+        if getattr(self.cfg, "filter_stopwords_at_selection", True):
+            id_to_token = self.tokenbook.id_to_token
+            masked, n_masked = mask_stopwords_in_scores(scores, id_to_token)
+            n_valid = int((masked > -1e11).sum())
+            if n_valid >= k:
+                selection_scores = masked
+            else:
+                logger.warning(
+                    "Too few non-stopword candidates (%d < k=%d); "
+                    "fallback to unfiltered scores.",
+                    n_valid,
+                    k,
+                )
+
         book_emb = self.tokenbook.get_embedding_matrix()
         top_ids = select_diverse_tokens(
-            scores,
+            selection_scores,
             book_emb,
             k=k,
             mmr_lambda=self.cfg.mmr_lambda,
@@ -484,10 +500,14 @@ def _run_smoke_test(args: argparse.Namespace) -> None:
     if not args.no_tfidf and tfidf_path.exists():
         tfidf = TFIDFComputer.load(tfidf_path)
 
+    data_source = getattr(args, "data_source", None)
+    if data_source == "auto":
+        data_source = None
     g, feats, _, _, _, _, text_dict = load_graph_data(
         args.dataset,
         root=args.data_root,
         seed=args.seed,
+        data_source=data_source,
     )
     texts = [text_dict[i] for i in range(g.num_nodes())]
     if args.use_fixture_tokenbook:
@@ -551,6 +571,13 @@ def _parse_main_args() -> argparse.Namespace:
     p.add_argument("--codebook_dir", type=str, required=True)
     p.add_argument("--dataset", type=str, default="cora")
     p.add_argument("--data_root", type=str, default="./data")
+    p.add_argument(
+        "--data_source",
+        type=str,
+        default=None,
+        choices=["auto", "text", "cpf"],
+        help="数据来源：auto=优先 data/dataset/{name}/",
+    )
     p.add_argument("--node", type=int, default=0)
     p.add_argument("--k", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)

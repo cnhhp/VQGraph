@@ -9,3 +9,8 @@ pyyaml
 sentence-transformers
 pandas
 scikit-learn
+transformers>=4.40
+peft>=0.10
+datasets
+accelerate
+# bitsandbytes  # 可选：QLoRA 4-bit 量化（需 CUDA；CPU/Windows 可跳过）

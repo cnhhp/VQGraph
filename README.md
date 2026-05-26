@@ -17,8 +17,29 @@ pip install -r requirements.txt
 Place datasets under `data/` (same as the original VQGraph README):
 
 - **CPF** (`cora`, `citeseer`, `pubmed`, `a-computer`, `a-photo`): `.npz` files from [Dropbox](https://www.dropbox.com/sh/fchrckrpf99gho2/AABZwMOeOnuiCxBjqYd46Qz3a?dl=0).
+- **Text DGL Cora** (recommended for LLM pipeline): put files under `data/dataset/cora/`:
+  - `cora_graph.pth` — DGL graph (`feat` [N,768], `label`, `train/val/test_mask`)
+  - `cora_text.pkl` — list of `"Title: ... Abstract: ..."` per node
+  - `cora_metadata.pth` — `categories` per node
 - **OGB** (`ogbn-arxiv`, `ogbn-products`): auto-downloaded via `dataloader.py`.
 - **NonHom** (`pokec`, `penn94`) and **BGNN** (`house_class`, `vk_class`): see original dataset instructions.
+
+### Text Cora auto-detection
+
+`load_graph_data('cora', root='./data')` uses **text DGL first** when `data/dataset/cora/cora_graph.pth` exists. Otherwise it falls back to CPF `data/cora.npz`.
+
+- Force text: `--data_source text`
+- Force CPF BoW: `--data_source cpf` (or remove/rename `data/dataset/cora/`)
+
+**After switching to text Cora, retrain the structural codebook** — node features are 768-dim (not 1433 BoW) and semantics use real Title+Abstract via Sentence-BERT:
+
+```bash
+python train_codebook.py --dataset cora --data_root ./data --compute_tfidf \
+  --tokenbook_dir ./codebook --warmup_epochs 20 --lambda_semantic 0.1 --device 0
+
+python preprocess_data.py --dataset cora --data_root ./data \
+  --codebook_dir ./outputs/codebook/cora/GCN/seed_0 --tokenbook_path ./codebook
+```
 
 ## Train teacher and export codebook
 
@@ -53,6 +74,50 @@ cb = np.load("outputs/transductive/cora/GCN/seed_0/codebook_embeddings.npz")["ar
 
 **Inductive setting** (optional): `--exp_setting ind --split_rate 0.2`
 
+## Module 5: LLM fine-tuning
+
+Generate JSONL first (module 2–4), then fine-tune with LoRA / QLoRA:
+
+```bash
+# Extra deps for module 5
+pip install transformers>=4.40 peft>=0.10 datasets accelerate
+# Optional for QLoRA 4-bit (CUDA only):
+# pip install bitsandbytes
+```
+
+**CPU / smoke test** (small model, few samples):
+
+```bash
+python finetune_llm.py \
+  --train_jsonl ./data/llm_finetune/train.jsonl \
+  --val_jsonl ./data/llm_finetune/val.jsonl \
+  --test_jsonl ./data/llm_finetune/test.jsonl \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct \
+  --mode lora \
+  --max_samples 20 \
+  --lora_epochs 1 \
+  --device -1 \
+  --output_dir ./outputs/llm_smoke
+```
+
+**Full training** (CUDA + HuggingFace access for Llama-3-8B):
+
+```bash
+python finetune_llm.py \
+  --train_jsonl ./data/llm_finetune/train.jsonl \
+  --val_jsonl ./data/llm_finetune/val.jsonl \
+  --test_jsonl ./data/llm_finetune/test.jsonl \
+  --mode both \
+  --device 0 \
+  --output_dir ./outputs/llm
+```
+
+Notes:
+
+- Default base model in `config.py` is `meta-llama/Meta-Llama-3-8B-Instruct`; override with `--base_model`.
+- QLoRA needs CUDA + `bitsandbytes`. On CPU or Windows without 4-bit support, use `--mode lora` or `--skip_qlora`.
+- Outputs: `outputs/llm/qlora/`, `outputs/llm/lora/`, and `finetune_metrics.json`.
+
 ## Project layout
 
 | File | Role |
@@ -65,6 +130,9 @@ cb = np.load("outputs/transductive/cora/GCN/seed_0/codebook_embeddings.npz")["ar
 | `data_preprocess.py` | Graph preprocessing helpers |
 | `utils.py` | Seeds, logging, config |
 | `train.conf.yaml` | Per-dataset GCN/SAGE hyperparameters |
+| `preprocess_data.py` | JSONL generation (modules 2–4) |
+| `finetune_llm.py` | LLM LoRA / QLoRA fine-tuning (module 5) |
+| `models/llm_finetune.py` | Instruction dataset + LLMFinetuner |
 
 ## Citation
 

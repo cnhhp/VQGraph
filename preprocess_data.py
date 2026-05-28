@@ -48,7 +48,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--codebook_dir", type=str, required=True, help="模块1 产物目录")
     p.add_argument("--tokenbook_path", type=str, default="./codebook")
     p.add_argument("--tfidf_path", type=str, default=None, help="默认 codebook_dir/tfidf_stats.npz")
-    p.add_argument("--output_dir", type=str, default="./data/llm_finetune")
+    p.add_argument(
+        "--output_dir",
+        type=str,
+        default="./data/llm_finetune_v2",
+        help="默认 v2（k=2, top_k=8）；v1 见 ./data/llm_finetune",
+    )
+    p.add_argument("--top_k", type=int, default=None, help="文本 token 数，默认读 config.top_k_text_tokens")
     p.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--split_idx", type=int, default=0)
@@ -233,6 +239,8 @@ def main() -> None:
         cfg.data_source = None if args.data_source == "auto" else args.data_source
     if args.node_text_csv:
         cfg.node_text_csv = Path(args.node_text_csv)
+    if args.top_k is not None:
+        cfg.top_k_text_tokens = args.top_k
 
     set_seed(args.seed)
     out_dir = Path(args.output_dir)
@@ -267,6 +275,12 @@ def main() -> None:
         "codebook_dir": str(args.codebook_dir),
         "tokenbook_path": str(args.tokenbook_path),
         "data_source": args.data_source or "auto",
+        "serialization": {
+            "subgraph_k_hop": cfg.subgraph_k_hop,
+            "top_k_text_tokens": cfg.top_k_text_tokens,
+            "mmr_candidate_pool": cfg.mmr_candidate_pool,
+            "max_seq_length_recommended": 768,
+        },
         "splits": {},
     }
     t_all = time.perf_counter()

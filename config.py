@@ -45,15 +45,15 @@ class Config:
     contrastive_weight: float = 0.1
 
     # ---------- 模块2：子图提取 ----------
-    subgraph_k_hop: int = 1
+    subgraph_k_hop: int = 2  # 阶段 B：1→2 hop，丰富结构上下文
     max_subgraph_nodes: Optional[int] = None  # None 表示不截断
 
     # ---------- 模块3：节点离散化 ----------
     text_vocab_size: int = 13648  # V（filtered_tokenbook.npy）
-    top_k_text_tokens: int = 5  # K
+    top_k_text_tokens: int = 8  # 阶段 B：5→8，增强类判别词覆盖
     lambda_tfidf: float = 0.5
     mmr_lambda: float = 0.5  # MMR 相关性权重，越大越偏向高分 token
-    mmr_candidate_pool: int = 64  # MMR 前按 score 保留的候选数
+    mmr_candidate_pool: int = 96  # 阶段 B：配合更大的 top_k
     filter_stopwords_at_selection: bool = True  # 选词时屏蔽停用词（词表不变）
     struct_token_prefix: str = "<S_"
 
@@ -66,19 +66,19 @@ class Config:
     # ---------- 模块5：大模型微调 ----------
     base_model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct"
     use_qlora: bool = True
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
+    lora_r: int = 8  # 阶段 A：16→8，减轻过拟合
+    lora_alpha: int = 16
+    lora_dropout: float = 0.1  # 阶段 A：0.05→0.1
     lora_target_modules: List[str] = field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
     )
-    finetune_lr: float = 2e-4
+    finetune_lr: float = 1e-4  # 阶段 A：2e-4→1e-4
     finetune_batch_size: int = 4
     gradient_accumulation_steps: int = 2
-    qlora_epochs: int = 3
+    qlora_epochs: int = 2  # 阶段 A：默认 2 epoch（原 5 epoch 易过拟合）
     lora_epochs: int = 5
-    warmup_ratio: float = 0.03
-    max_seq_length: int = 512
+    warmup_ratio: float = 0.06  # 阶段 A：略增 warmup
+    max_seq_length: int = 768  # 阶段 B：k=2 + top_k=8 序列更长
     finetune_seed: int = 42
     qlora_val_acc_threshold: float = 0.0  # QLoRA 最低 val 准确率；0 表示不阻断
     finetune_eval_batch_size: int = 4

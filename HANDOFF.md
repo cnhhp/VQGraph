@@ -70,16 +70,22 @@ Host vqgraph-gpu
 
 ---
 
-## 5. 关键配置（`config.py`）
+## 5. 关键配置（`config.py`，阶段 A+B 默认）
 
 ```text
-tokenbook: filtered_tokenbook.npy, text_vocab_size=13648
-top_k_text_tokens=5, lambda_tfidf=0.5, mmr_lambda=0.5, mmr_candidate_pool=64
-filter_stopwords_at_selection=True
-base_model_name=meta-llama/Meta-Llama-3-8B-Instruct
-lora_r=16, lora_alpha=32, finetune_lr=2e-4, batch=4, grad_accum=2
-qlora_epochs=3, lora_epochs=5, max_seq_length=512
+# 阶段 B — 序列化
+subgraph_k_hop=2, top_k_text_tokens=8, mmr_candidate_pool=96
+
+# 阶段 A — QLoRA 正则
+lora_r=8, lora_alpha=16, lora_dropout=0.1, finetune_lr=1e-4
+qlora_epochs=2, warmup_ratio=0.06, max_seq_length=768
+
+# 其它
+tokenbook: filtered_tokenbook.npy, lambda_tfidf=0.5, batch=4, grad_accum=2
 ```
+
+**v1 旧数据（k=1, top_k=5）：** `data/llm_finetune/`（仍可用于对比）  
+**v2 新数据（k=2, top_k=8）：** 需用当前 config 重跑 `preprocess_data.py` → `data/llm_finetune_v2/`
 
 ---
 
@@ -94,10 +100,11 @@ outputs/codebook/cora/GCN/seed_0/
   train_conf.json, config.json
 ```
 
-### LLM 训练数据（已 push GitHub）
+### LLM 训练数据
 
 ```text
-data/llm_finetune/
+data/llm_finetune/          # v1：k=1, top_k=5（GitHub 已有）
+data/llm_finetune_v2/       # v2：k=2, top_k=8（服务器本地生成，勿提交大文件）
   train.jsonl (140), val.jsonl (500), test.jsonl (1000)
   manifest.json
 ```
@@ -146,10 +153,13 @@ python train_codebook.py --dataset cora --data_root ./data --data_source text \
 python train_codebook.py --tfidf_only --dataset cora --data_root ./data \
   --tokenbook_dir ./codebook --device 0
 
-# 生成 JSONL（全量）
+# 生成 JSONL v2（阶段 B，默认 k=2 top_k=8 → llm_finetune_v2）
 python preprocess_data.py --dataset cora --data_root ./data --data_source text \
   --codebook_dir ./outputs/codebook/cora/GCN/seed_0 \
-  --tokenbook_path ./codebook --output_dir ./data/llm_finetune --device 0
+  --tokenbook_path ./codebook --device 0
+
+# 生成 JSONL v1（旧版对比）
+python preprocess_data.py ... --output_dir ./data/llm_finetune --k 1 --top_k 5
 
 # GCN 正式基线（文本 Cora，与 LLM 相同 140/500/1000 划分）
 python train_gcn_baseline.py --dataset cora --data_root ./data --device 0 --console_log --save_model
@@ -159,14 +169,17 @@ python -m models.serialization --codebook_dir ./outputs/codebook/cora/GCN/seed_0
   --tokenbook_path ./codebook --dataset cora --data_root ./data \
   --data_source text --node 0 --device 0
 
-# LLM 正式 QLoRA（服务器，本地模型路径）
+# LLM QLoRA 阶段 A+B（v2 数据 + 默认正则超参）
 python finetune_llm.py \
-  --train_jsonl ./data/llm_finetune/train.jsonl \
-  --val_jsonl ./data/llm_finetune/val.jsonl \
-  --test_jsonl ./data/llm_finetune/test.jsonl \
-  --base_model /home/power/models/Meta-Llama-3-8B-Instruct \
-  --mode qlora --qlora_epochs 5 --device 0 \
-  --output_dir ./outputs/llm_qlora
+  --train_jsonl ./data/llm_finetune_v2/train.jsonl \
+  --val_jsonl ./data/llm_finetune_v2/val.jsonl \
+  --test_jsonl ./data/llm_finetune_v2/test.jsonl \
+  --base_model ~/huanghp_2252895/Meta-Llama-3-8B-Instruct \
+  --mode qlora --device 0 \
+  --output_dir ./outputs/llm_qlora_v2
+
+# v1 基线对比（71% val 那次）
+# --train_jsonl ./data/llm_finetune/... --output_dir ./outputs/llm_qlora
 ```
 
 ---

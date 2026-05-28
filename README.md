@@ -88,6 +88,16 @@ cb = np.load("outputs/transductive/cora/GCN/seed_0/codebook_embeddings.npz")["ar
 
 ## Module 5: LLM fine-tuning
 
+**Phase A+B defaults** (in `config.py`): `subgraph_k_hop=2`, `top_k_text_tokens=8`, QLoRA `epochs=2`, `lora_r=8`, `dropout=0.1`, `lr=1e-4`, `max_seq_length=768`.
+
+Generate JSONL v2 (then fine-tune):
+
+```bash
+python preprocess_data.py --dataset cora --data_root ./data --data_source text \
+  --codebook_dir ./outputs/codebook/cora/GCN/seed_0 --tokenbook_path ./codebook --device 0
+# → ./data/llm_finetune_v2/
+```
+
 Generate JSONL first (module 2–4), then fine-tune with LoRA / QLoRA:
 
 ```bash
@@ -112,17 +122,20 @@ python finetune_llm.py \
   --output_dir ./outputs/llm_smoke
 ```
 
-**Full training** (CUDA + HuggingFace access for Llama-3-8B):
+**Full training** (CUDA + local Llama-3 path on server):
 
 ```bash
 python finetune_llm.py \
-  --train_jsonl ./data/llm_finetune/train.jsonl \
-  --val_jsonl ./data/llm_finetune/val.jsonl \
-  --test_jsonl ./data/llm_finetune/test.jsonl \
-  --mode both \
+  --train_jsonl ./data/llm_finetune_v2/train.jsonl \
+  --val_jsonl ./data/llm_finetune_v2/val.jsonl \
+  --test_jsonl ./data/llm_finetune_v2/test.jsonl \
+  --base_model /path/to/Meta-Llama-3-8B-Instruct \
+  --mode qlora \
   --device 0 \
-  --output_dir ./outputs/llm
+  --output_dir ./outputs/llm_qlora_v2
 ```
+
+See [`HANDOFF.md`](HANDOFF.md) and [`scripts/run_phase_ab_server.sh`](scripts/run_phase_ab_server.sh) for the full server workflow.
 
 Notes:
 

@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora_epochs", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None, help="同时覆盖 qlora/lora 单模式 epoch")
     p.add_argument("--max_seq_length", type=int, default=None)
+    p.add_argument("--lora_r", type=int, default=None, help="LoRA rank（默认读 config）")
+    p.add_argument("--lora_alpha", type=int, default=None)
+    p.add_argument("--lora_dropout", type=float, default=None)
+    p.add_argument("--finetune_lr", type=float, default=None)
+    p.add_argument("--warmup_ratio", type=float, default=None)
     return p.parse_args()
 
 
@@ -54,6 +59,16 @@ def main() -> None:
             cfg.qlora_epochs = args.epochs
         elif args.mode == "lora":
             cfg.lora_epochs = args.epochs
+    if args.lora_r is not None:
+        cfg.lora_r = args.lora_r
+    if args.lora_alpha is not None:
+        cfg.lora_alpha = args.lora_alpha
+    if args.lora_dropout is not None:
+        cfg.lora_dropout = args.lora_dropout
+    if args.finetune_lr is not None:
+        cfg.finetune_lr = args.finetune_lr
+    if args.warmup_ratio is not None:
+        cfg.warmup_ratio = args.warmup_ratio
 
     set_seed(args.seed)
     out_dir = Path(args.output_dir)

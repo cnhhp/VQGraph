@@ -41,6 +41,18 @@ python preprocess_data.py --dataset cora --data_root ./data \
   --codebook_dir ./outputs/codebook/cora/GCN/seed_0 --tokenbook_path ./codebook
 ```
 
+## GCN classification baseline (no VQ)
+
+Standard 2-layer GCN for node classification on the **same Cora masks** as the LLM pipeline (140 / 500 / 1000). Use this to compare against QLoRA and the VQ codebook teacher.
+
+```bash
+python train_gcn_baseline.py --dataset cora --data_root ./data --device 0 --console_log --save_model
+```
+
+Output: `outputs/baseline_gcn/cora/seed_0/baseline_metrics.json` (train / val / test accuracy and per-class breakdown).
+
+Hyperparameters default from `train.conf.yaml` (`cora` → `GCN`: hidden 64, dropout 0.8, weight_decay 0.001; lr defaults to 0.01).
+
 ## Train teacher and export codebook
 
 **GCN (full-graph, recommended for small graphs):**

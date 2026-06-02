@@ -73,6 +73,19 @@ def parse_args() -> argparse.Namespace:
         help="数据来源：auto=优先 data/dataset/{name}/ 文本版",
     )
     p.add_argument("--node_text_csv", type=str, default=None, help="可选，覆盖部分节点文本")
+    p.add_argument(
+        "--lambda_pred",
+        type=float,
+        default=None,
+        help="P_code 融合强度；0 表示禁用 P_code（仅 TF-IDF + text_sim）",
+    )
+    p.add_argument(
+        "--p_code_normalize",
+        type=str,
+        default=None,
+        choices=["none", "max", "minmax"],
+        help="推理时 P_code 归一化方式",
+    )
     return p.parse_args()
 
 
@@ -241,6 +254,10 @@ def main() -> None:
         cfg.node_text_csv = Path(args.node_text_csv)
     if args.top_k is not None:
         cfg.top_k_text_tokens = args.top_k
+    if args.lambda_pred is not None:
+        cfg.lambda_pred = args.lambda_pred
+    if args.p_code_normalize is not None:
+        cfg.p_code_normalize = args.p_code_normalize
 
     set_seed(args.seed)
     out_dir = Path(args.output_dir)
@@ -280,6 +297,9 @@ def main() -> None:
             "top_k_text_tokens": cfg.top_k_text_tokens,
             "mmr_candidate_pool": cfg.mmr_candidate_pool,
             "max_seq_length_recommended": 768,
+            "lambda_pred": cfg.lambda_pred,
+            "p_code_normalize": cfg.p_code_normalize,
+            "lambda_tfidf": cfg.lambda_tfidf,
         },
         "splits": {},
     }

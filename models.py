@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from dgl.nn import GraphConv
 from vq import VectorQuantize
 import dgl
+
+from models.token_predictor import attach_token_predictor_to_encoder, maybe_add_token_loss
 
 
 class GCN(nn.Module):
@@ -24,6 +26,7 @@ class GCN(nn.Module):
     ):
         super().__init__()
         self.num_layers = num_layers
+        self.input_dim = input_dim
         self.norm_type = norm_type
         self.dropout = nn.Dropout(dropout_ratio)
         self.norms = nn.ModuleList()
@@ -41,6 +44,18 @@ class GCN(nn.Module):
         )
         self.lamb_edge = lamb_edge
         self.lamb_node = lamb_node
+        self.token_predictor: Optional[nn.Linear] = None
+        self.lambda_token: float = 0.0
+        self.token_pred_tau: float = 1.0
+        self.token_target_tau: float = 0.15
+
+    def attach_token_predictor(
+        self,
+        vocab_size: int,
+        tokenbook_embeddings: torch.Tensor,
+        cfg: Union[object, dict],
+    ) -> None:
+        attach_token_predictor_to_encoder(self, vocab_size, tokenbook_embeddings, cfg)
 
     def forward(self, g, feats, text_emb: Optional[torch.Tensor] = None):
         h = feats
@@ -72,7 +87,12 @@ class GCN(nn.Module):
         h = self.linear(h)
         loss = feature_rec_loss + edge_rec_loss + commit_loss
 
-        return h_list, h, loss, dist, codebook
+        token_loss_weighted, token_loss_raw = maybe_add_token_loss(
+            self, quantized, text_emb
+        )
+        loss = loss + token_loss_weighted
+
+        return h_list, h, loss, dist, codebook, token_loss_raw
 
 
 class SAGE(nn.Module):
@@ -112,6 +132,18 @@ class SAGE(nn.Module):
         )
         self.lamb_edge = lamb_edge
         self.lamb_node = lamb_node
+        self.token_predictor: Optional[nn.Linear] = None
+        self.lambda_token: float = 0.0
+        self.token_pred_tau: float = 1.0
+        self.token_target_tau: float = 0.15
+
+    def attach_token_predictor(
+        self,
+        vocab_size: int,
+        tokenbook_embeddings: torch.Tensor,
+        cfg: Union[object, dict],
+    ) -> None:
+        attach_token_predictor_to_encoder(self, vocab_size, tokenbook_embeddings, cfg)
 
     def forward(self, blocks, feats, text_emb: Optional[torch.Tensor] = None):
         h = feats
@@ -151,8 +183,14 @@ class SAGE(nn.Module):
         h_list.append(h)
         h = self.linear(h)
         loss = feature_rec_loss + edge_rec_loss + commit_loss
+
+        token_loss_weighted, token_loss_raw = maybe_add_token_loss(
+            self, quantized, text_emb
+        )
+        loss = loss + token_loss_weighted
+
         h = h[: blocks[-1].num_dst_nodes()]
-        return h_list, h, loss, dist, codebook
+        return h_list, h, loss, dist, codebook, token_loss_raw
 
     def inference(self, dataloader, feats, text_emb: Optional[torch.Tensor] = None):
         device = feats.device
@@ -201,7 +239,7 @@ class SAGE(nn.Module):
             h = h[: block.num_dst_nodes()]
             y[output_nodes] = h
 
-        return h_list, y, loss, dist_all, codebook
+        return h_list, y, loss, dist_all, codebook, None
 
 
 class Model(nn.Module):
@@ -241,10 +279,21 @@ class Model(nn.Module):
                 f"Unsupported teacher model: {conf['model_name']}. Use GCN or SAGE."
             )
 
+    def attach_token_predictor(
+        self,
+        vocab_size: int,
+        tokenbook_embeddings: torch.Tensor,
+        cfg: Union[object, dict],
+    ) -> None:
+        self.encoder.attach_token_predictor(vocab_size, tokenbook_embeddings, cfg)
+
     def forward(self, data, feats, text_emb: Optional[torch.Tensor] = None):
         return self.encoder(data, feats, text_emb=text_emb)
 
     def inference(self, data, feats, text_emb: Optional[torch.Tensor] = None):
         if "SAGE" in self.model_name:
             return self.encoder.inference(data, feats, text_emb=text_emb)
-        return self.forward(data, feats, text_emb=text_emb)
+        out = self.forward(data, feats, text_emb=text_emb)
+        if len(out) == 5:
+            return out + (None,)
+        return out

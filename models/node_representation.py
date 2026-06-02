@@ -27,6 +27,11 @@ from models.codebook_trainer import (
 from models.structural_codebook import CodebookArtifacts, TFIDFStatistics
 from models.subgraph_extraction import LocalSubgraph, SubgraphExtractor
 from models._root_bridge import load_root_models_module
+from models.token_predictor import (
+    FactorizedTokenPredictor,
+    TokenPredictorHead,
+    compute_p_code,
+)
 
 Model = load_root_models_module().Model
 
@@ -141,9 +146,9 @@ class NodeRepresentationTokenizer:
     对子图中每个节点生成 text_tokens + struct_token。
 
     文本筛选::
-        score[t] = text_sim[t] * (1 + λ_tfidf * TF-IDF_norm[c][t])
+        score[t] = text_sim[t] * (1 + λ_tfidf * TF-IDF_norm[c][t] + λ_pred * P_code[t])
         再用 MMR（select_diverse_tokens）从 scores 中选出 K 个多样 token。
-    未见结构码时退化为纯 text_sim。
+    未见结构码 / 无 TF-IDF / 无 token_predictor 时退化为纯 text_sim。
     """
 
     def __init__(
@@ -196,7 +201,39 @@ class NodeRepresentationTokenizer:
 
         model = Model(conf)
         _wrap_semantic_vq(model, text_dim, self.cfg)
-        model.load_state_dict(self.artifacts.encoder_state_dict)
+
+        state = self.artifacts.encoder_state_dict
+        pred_proj_key = "encoder.token_predictor.proj.weight"
+        pred_w_key = "encoder.token_predictor.weight"
+        if pred_proj_key in state:
+            code_dim = state[pred_proj_key].shape[1]
+            text_dim = state[pred_proj_key].shape[0]
+            model.encoder.token_predictor = FactorizedTokenPredictor(
+                code_dim, text_dim
+            ).to(device)
+            model.encoder.token_predictor_type = "factorized"
+        elif pred_w_key in state:
+            vocab_size, code_dim = (
+                state[pred_w_key].shape[0],
+                state[pred_w_key].shape[1],
+            )
+            model.encoder.token_predictor = TokenPredictorHead(
+                code_dim, vocab_size
+            ).to(device)
+            model.encoder.token_predictor_type = "linear"
+        if pred_proj_key in state or pred_w_key in state:
+            model.encoder.lambda_token = self.cfg.lambda_token
+            model.encoder.token_pred_tau = self.cfg.token_pred_temperature
+            model.encoder.token_target_tau = self.cfg.token_target_temperature
+            if "encoder.tokenbook_embeddings" in state:
+                tb = state["encoder.tokenbook_embeddings"]
+                model.encoder.register_buffer("tokenbook_embeddings", tb.to(device))
+
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            logger.debug("load_encoder missing keys: %s", missing[:5])
+        if unexpected:
+            logger.debug("load_encoder unexpected keys: %s", unexpected[:5])
         model.to(device)
         model.eval()
         self.encoder = model
@@ -255,12 +292,14 @@ class NodeRepresentationTokenizer:
                     shuffle=False,
                     num_workers=0,
                 )
-                _, _, _, dist, _ = model.inference(
+                infer_out = model.inference(
                     loader, feats, text_emb=text_emb
                 )
+                dist = infer_out[3]
             else:
                 g = graph.to(device)
-                _, _, _, dist, _ = model.inference(g, feats, text_emb=text_emb)
+                infer_out = model.inference(g, feats, text_emb=text_emb)
+                dist = infer_out[3]
 
         if dist.dim() == 3:
             dist = dist.squeeze(0)
@@ -325,20 +364,75 @@ class NodeRepresentationTokenizer:
 
         return aligned
 
+    def _compute_p_code(self, struct_code_idx: int) -> np.ndarray:
+        """
+        结构码向量经 token_predictor 得到 P_code[t]，shape [V]。
+
+        旧 checkpoint 无 predictor 或 λ_pred=0 时返回全零。
+        """
+        vocab_size = len(self.tokenbook.token_to_id)
+        zeros = np.zeros(vocab_size, dtype=np.float64)
+        if self.cfg.lambda_pred <= 0:
+            return zeros
+
+        num_codes = self.artifacts.codebook_embeddings.shape[0]
+        if struct_code_idx < 0 or struct_code_idx >= num_codes:
+            return zeros
+
+        model = self.load_encoder()
+        predictor = getattr(model.encoder, "token_predictor", None)
+        if predictor is None:
+            return zeros
+
+        code_vec = self.artifacts.codebook_embeddings[struct_code_idx].to(
+            self.device
+        )
+        tokenbook_emb = getattr(model.encoder, "tokenbook_embeddings", None)
+        normalize = getattr(self.cfg, "p_code_normalize", "none")
+        with torch.no_grad():
+            probs = compute_p_code(
+                code_vec,
+                predictor,
+                tau=self.cfg.token_pred_temperature,
+                tokenbook_emb=tokenbook_emb,
+                normalize=normalize,
+            )
+        p = probs.detach().cpu().numpy().astype(np.float64)
+        if p.shape[0] != vocab_size:
+            aligned = np.zeros(vocab_size, dtype=np.float64)
+            n = min(len(p), vocab_size)
+            aligned[:n] = p[:n]
+            return aligned
+        return p
+
     def _fuse_scores(
         self,
         text_sim: np.ndarray,
         struct_code_idx: int,
+        p_code: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        score[t] = text_sim[t] * (1 + λ * TF-IDF_norm[c][t])；
-        异常码索引或空 TF-IDF 行时退化为 text_sim。
+        score[t] = text_sim[t] * (1 + λ_tfidf * prior[t] + λ_pred * P_code[t])；
+        无 TF-IDF / P_code 时对应项为 0。
         """
         prior = self._align_tfidf_row(struct_code_idx)
-        if prior.max() < 1e-8:
+        if p_code is None:
+            p_code = self._compute_p_code(struct_code_idx)
+
+        lam_tfidf = self.cfg.lambda_tfidf
+        lam_pred = self.cfg.lambda_pred
+        has_prior = prior.max() >= 1e-8
+        has_p_code = lam_pred > 0 and p_code.max() >= 1e-8
+
+        if not has_prior and not has_p_code:
             return text_sim
-        lam = self.cfg.lambda_tfidf
-        return text_sim * (1.0 + lam * prior)
+
+        multiplier = np.ones_like(text_sim, dtype=np.float64)
+        if has_prior:
+            multiplier = multiplier + lam_tfidf * prior
+        if has_p_code:
+            multiplier = multiplier + lam_pred * p_code
+        return text_sim * multiplier
 
     def select_text_tokens(
         self,

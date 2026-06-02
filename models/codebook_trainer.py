@@ -79,16 +79,17 @@ def train_semantic_fixed(
     optimizer: optim.Optimizer,
     idx_train: torch.Tensor,
     lamb: float = 1.0,
-) -> float:
+) -> Tuple[float, Optional[float]]:
     model.train()
     optimizer.zero_grad()
-    _, logits, loss, _, _ = model(data, feats, text_emb=text_emb)
+    _, logits, loss, _, _, token_loss_raw = model(data, feats, text_emb=text_emb)
     out = logits.log_softmax(dim=1)
     loss = loss + criterion(out[idx_train], labels[idx_train])
     loss_val = loss.item()
+    token_loss_val = float(token_loss_raw.item()) if token_loss_raw is not None else None
     (loss * lamb).backward()
     optimizer.step()
-    return loss_val
+    return loss_val, token_loss_val
 
 
 def train_sage_semantic(
@@ -100,10 +101,12 @@ def train_sage_semantic(
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     lamb: float = 1.0,
-) -> float:
+) -> Tuple[float, Optional[float]]:
     device = feats.device
     model.train()
     total_loss = 0.0
+    total_token_loss = 0.0
+    token_loss_batches = 0
     n_batches = 0
     for _step, (input_nodes, output_nodes, blocks) in enumerate(dataloader):
         blocks = [blk.int().to(device) for blk in blocks]
@@ -111,14 +114,95 @@ def train_sage_semantic(
         batch_labels = labels[output_nodes]
         batch_text = text_emb[input_nodes]
         optimizer.zero_grad()
-        _, logits, loss, _, _ = model(blocks, batch_feats, text_emb=batch_text)
+        _, logits, loss, _, _, token_loss_raw = model(
+            blocks, batch_feats, text_emb=batch_text
+        )
         out = logits.log_softmax(dim=1)
         loss = loss + criterion(out, batch_labels)
         total_loss += loss.item()
+        if token_loss_raw is not None:
+            total_token_loss += float(token_loss_raw.item())
+            token_loss_batches += 1
         (loss * lamb).backward()
         optimizer.step()
         n_batches += 1
-    return total_loss / max(n_batches, 1)
+    avg_token = (
+        total_token_loss / token_loss_batches if token_loss_batches > 0 else None
+    )
+    return total_loss / max(n_batches, 1), avg_token
+
+
+def train_predictor_code_level(
+    model: Model,
+    codebook: torch.Tensor,
+    semantic_centers: torch.Tensor,
+    tokenbook_emb: torch.Tensor,
+    optimizer: optim.Optimizer,
+    tau: float = 1.0,
+    tau_prime: float = 0.03,
+    top_k: int = 64,
+    lambda_token: float = 0.5,
+) -> Tuple[float, Optional[float]]:
+    """码本级 KL：z=codebook[c]，目标=semantic_centers[c]→token 分布（与推理对齐）。"""
+    from models.token_predictor import compute_token_kl_loss
+
+    predictor = model.encoder.token_predictor
+    predictor.train()
+    optimizer.zero_grad()
+    token_loss = compute_token_kl_loss(
+        codebook,
+        semantic_centers,
+        tokenbook_emb,
+        predictor,
+        tau=tau,
+        tau_prime=tau_prime,
+        top_k=top_k,
+    )
+    (lambda_token * token_loss).backward()
+    optimizer.step()
+    return float(token_loss.item()), float(token_loss.item())
+
+
+def train_predictor_only_fixed(
+    model: Model,
+    data: Any,
+    feats: torch.Tensor,
+    text_emb: torch.Tensor,
+    optimizer: optim.Optimizer,
+) -> Tuple[float, Optional[float]]:
+    """冻结 VQ/encoder，仅对 token_predictor 反传 L_token。"""
+    model.eval()
+    encoder = model.encoder
+    encoder.token_predictor.train()
+    optimizer.zero_grad()
+    with torch.no_grad():
+        h = feats
+        g = data
+        h = encoder.graph_layer_1(g, h)
+        h = encoder.dropout(h)
+        if text_emb is not None:
+            quantized, _, _, _, _ = encoder.vq(h, text_emb=text_emb)
+        else:
+            quantized, _, _, _, _ = encoder.vq(h)
+    from models.token_predictor import maybe_add_token_loss
+
+    token_loss_weighted, token_loss_raw = maybe_add_token_loss(
+        encoder, quantized, text_emb
+    )
+    if token_loss_raw is None:
+        return 0.0, None
+    token_loss_weighted.backward()
+    optimizer.step()
+    return float(token_loss_weighted.item()), float(token_loss_raw.item())
+
+
+def _freeze_all_but_predictor(model: Model) -> None:
+    for param in model.parameters():
+        param.requires_grad = False
+    predictor = getattr(model.encoder, "token_predictor", None)
+    if predictor is not None:
+        for param in predictor.parameters():
+            param.requires_grad = True
 
 
 def evaluate_semantic(
@@ -133,7 +217,8 @@ def evaluate_semantic(
 ) -> Tuple[torch.Tensor, float, float, Any, torch.Tensor, torch.Tensor]:
     model.eval()
     with torch.no_grad():
-        _, logits, _, dist, codebook = model.inference(data, feats, text_emb=text_emb)
+        infer_out = model.inference(data, feats, text_emb=text_emb)
+        _, logits, _, dist, codebook = infer_out[:5]
         out = logits.log_softmax(dim=1)
         if idx_eval is None:
             loss = criterion(out, labels).item()
@@ -168,15 +253,17 @@ def assign_node_codes(
             num_workers=0,
         )
         with torch.no_grad():
-            _, _, _, dist_all, _ = model.inference(
+            infer_out = model.inference(
                 loader, feats.to(device), text_emb=text_emb.to(device)
             )
+            dist_all = infer_out[3]
         codes = dist_all.argmax(dim=1).cpu().numpy()
     else:
         with torch.no_grad():
-            _, _, _, dist, _ = model.inference(
+            infer_out = model.inference(
                 g.to(device), feats.to(device), text_emb=text_emb.to(device)
             )
+            dist = infer_out[3]
         if dist.dim() == 3:
             dist = dist.squeeze(0)
         codes = dist.argmax(dim=1).cpu().numpy()
@@ -232,6 +319,75 @@ class CodebookTrainer:
         model = self.build_model(conf)
         self.wrap_semantic_vq(text_embeddings.shape[1])
 
+        use_token_pred = (
+            self.cfg.enable_token_predictor and self.cfg.lambda_token > 0
+        )
+        if use_token_pred:
+            from text_tokenizers.text_tokenbook import TextTokenbook
+
+            tokenbook_dir = Path(
+                conf.get("tokenbook_dir")
+                or self.cfg.tokenbook_path
+                or "./codebook"
+            )
+            vocab_path = tokenbook_dir / self.cfg.tokenbook_vocab_filename
+            if not vocab_path.exists():
+                raise FileNotFoundError(
+                    f"Tokenbook vocabulary required for token predictor: {vocab_path}"
+                )
+            tokenbook = TextTokenbook.load(
+                tokenbook_dir,
+                cfg=self.cfg,
+                model_name=self.cfg.sentence_bert_model,
+                device=device,
+                build_embeddings=True,
+            )
+            model.attach_token_predictor(
+                len(tokenbook),
+                tokenbook.get_embedding_matrix(),
+                self.cfg,
+            )
+            log.info(
+                "Token predictor attached: V=%d, type=%s, top_k=%d, lambda_token=%.4f, "
+                "tau=%.2f, tau_prime=%.2f",
+                len(tokenbook),
+                getattr(self.cfg, "token_predictor_type", "linear"),
+                getattr(self.cfg, "token_kl_top_k", 0),
+                self.cfg.lambda_token,
+                self.cfg.token_pred_temperature,
+                self.cfg.token_target_temperature,
+            )
+
+        load_ckpt = conf.get("load_checkpoint")
+        if load_ckpt:
+            ckpt_path = Path(load_ckpt)
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"load_checkpoint not found: {ckpt_path}")
+            state = torch.load(ckpt_path, map_location=device, weights_only=False)
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            log.info(
+                "Loaded checkpoint %s (missing=%d, unexpected=%d)",
+                ckpt_path,
+                len(missing),
+                len(unexpected),
+            )
+
+        predictor_only = bool(conf.get("predictor_only", False))
+        if predictor_only:
+            return self._fit_predictor_only(
+                model=model,
+                g=g,
+                feats=feats,
+                labels=labels,
+                text_embeddings=text_embeddings,
+                idx_train=idx_train,
+                idx_val=idx_val,
+                idx_test=idx_test,
+                conf=conf,
+                output_dir=output_dir,
+                log=log,
+            )
+
         criterion = nn.NLLLoss()
         evaluator = get_evaluator(conf["dataset"])
         lr = conf.get("learning_rate") or self.cfg.codebook_lr
@@ -273,10 +429,26 @@ class CodebookTrainer:
             g = g.to(device)
             data_train, data_eval = g, g
 
+        stable_min_epoch = conf.get("tfidf_stats_min_epoch")
+        if stable_min_epoch is None:
+            stable_min_epoch = getattr(self.cfg, "tfidf_stats_min_epoch", None)
+        if stable_min_epoch is None:
+            stable_min_epoch = warmup_epochs + 1
+        stable_min_epoch = int(stable_min_epoch)
+        self.cfg.tfidf_stats_min_epoch = stable_min_epoch
+        log.info(
+            "Best checkpoint & TF-IDF stats use epochs >= %d (warmup_epochs=%d)",
+            stable_min_epoch,
+            warmup_epochs,
+        )
+
         best_epoch, best_score_val, count = 0, 0.0, 0
         state = copy.deepcopy(model.state_dict())
+        latest_state = state
+        last_epoch = 0
 
         for epoch in range(1, max_epoch + 1):
+            last_epoch = epoch
             self.current_epoch = epoch
             in_warmup = epoch <= warmup_epochs
             lam_eff = 0.0 if in_warmup else self.cfg.lambda_semantic
@@ -284,7 +456,7 @@ class CodebookTrainer:
             self.svq.set_lambda_effective(lam_eff)
 
             if "SAGE" in model.model_name:
-                loss = train_sage_semantic(
+                loss, token_loss = train_sage_semantic(
                     model,
                     data_train,
                     feats,
@@ -294,7 +466,7 @@ class CodebookTrainer:
                     optimizer,
                 )
             else:
-                loss = train_semantic_fixed(
+                loss, token_loss = train_semantic_fixed(
                     model,
                     data_train,
                     feats,
@@ -317,29 +489,68 @@ class CodebookTrainer:
                     idx_val,
                 )
                 score_test = evaluator(out[idx_test], labels[idx_test])
-                log.info(
-                    "Ep %3d | warmup=%s | lambda_eff=%.4f | loss=%.4f | "
-                    "s_val=%.4f | s_test=%.4f",
-                    epoch,
-                    in_warmup,
-                    lam_eff,
-                    loss,
-                    score_val,
-                    score_test,
-                )
-                if score_val >= best_score_val:
-                    best_epoch = epoch
-                    best_score_val = score_val
-                    state = copy.deepcopy(model.state_dict())
-                    count = 0
+                if token_loss is not None:
+                    log.info(
+                        "Ep %3d | warmup=%s | lambda_eff=%.4f | loss=%.4f | "
+                        "L_token=%.4f | s_val=%.4f | s_test=%.4f",
+                        epoch,
+                        in_warmup,
+                        lam_eff,
+                        loss,
+                        token_loss,
+                        score_val,
+                        score_test,
+                    )
                 else:
-                    count += 1
+                    log.info(
+                        "Ep %3d | warmup=%s | lambda_eff=%.4f | loss=%.4f | "
+                        "s_val=%.4f | s_test=%.4f",
+                        epoch,
+                        in_warmup,
+                        lam_eff,
+                        loss,
+                        score_val,
+                        score_test,
+                    )
+                latest_state = copy.deepcopy(model.state_dict())
+                if epoch >= stable_min_epoch:
+                    if best_epoch < stable_min_epoch or score_val >= best_score_val:
+                        best_epoch = epoch
+                        best_score_val = score_val
+                        state = copy.deepcopy(latest_state)
+                        count = 0
+                    else:
+                        count += 1
+                else:
+                    log.debug(
+                        "Ep %d before stable_min_epoch=%d; skip best/patience",
+                        epoch,
+                        stable_min_epoch,
+                    )
 
-            if count >= patience or epoch == max_epoch:
+            if epoch >= stable_min_epoch and count >= patience:
+                break
+            if epoch == max_epoch:
                 break
 
-        model.load_state_dict(state)
-        log.info("Best epoch %d, val acc %.4f", best_epoch, best_score_val)
+        if best_epoch >= stable_min_epoch:
+            model.load_state_dict(state)
+            log.info(
+                "Best epoch %d (>= stable min %d), val acc %.4f",
+                best_epoch,
+                stable_min_epoch,
+                best_score_val,
+            )
+        else:
+            model.load_state_dict(latest_state)
+            best_epoch = last_epoch
+            log.warning(
+                "No eval after stable_min_epoch=%d; using final epoch %d weights for "
+                "model + TF-IDF node codes",
+                stable_min_epoch,
+                last_epoch,
+            )
+            state = copy.deepcopy(latest_state)
 
         node_codes = assign_node_codes(
             model, g, feats, text_embeddings, device, conf.get("batch_size", 512)
@@ -353,6 +564,95 @@ class CodebookTrainer:
             save_dir=output_dir,
         )
         self.save_artifacts(artifacts, output_dir, train_conf=conf)
+        return artifacts
+
+    def _fit_predictor_only(
+        self,
+        model: Model,
+        g: Any,
+        feats: torch.Tensor,
+        labels: torch.Tensor,
+        text_embeddings: torch.Tensor,
+        idx_train: torch.Tensor,
+        idx_val: torch.Tensor,
+        idx_test: torch.Tensor,
+        conf: Dict[str, Any],
+        output_dir: Path,
+        log: logging.Logger,
+    ) -> CodebookArtifacts:
+        """E5：冻结 VQ/encoder，仅训练 token_predictor；复用 init_dir 的结构码与码本。"""
+        device = conf["device"]
+        init_dir = Path(conf.get("init_from_dir") or "")
+        if not (init_dir / "codebook_embeddings.npz").exists():
+            load_path = conf.get("load_checkpoint")
+            if not load_path:
+                raise ValueError("predictor_only needs init_from_dir or load_checkpoint")
+            init_dir = Path(load_path).parent
+        old = self.load_artifacts(init_dir, device)
+        log.info("Predictor-only mode: frozen weights from %s", init_dir)
+
+        _freeze_all_but_predictor(model)
+        pred_lr = conf.get("predictor_lr", 1e-3)
+        optimizer = optim.Adam(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=pred_lr,
+            weight_decay=0.0,
+        )
+        max_epoch = int(
+            conf.get("predictor_only_epochs") or self.cfg.predictor_only_epochs
+        )
+        use_code_level = bool(conf.get("predictor_code_level", True))
+        tokenbook_emb = getattr(model.encoder, "tokenbook_embeddings", None)
+        codebook = self.svq.codebook.detach()
+        sem_centers = self.svq.semantic_centers.detach()
+        g = g.to(device)
+        best_token_loss = float("inf")
+        best_state = copy.deepcopy(model.state_dict())
+
+        for epoch in range(1, max_epoch + 1):
+            self.svq.set_lambda_effective(self.cfg.lambda_semantic)
+            if use_code_level and tokenbook_emb is not None:
+                loss, token_loss = train_predictor_code_level(
+                    model,
+                    codebook,
+                    sem_centers,
+                    tokenbook_emb,
+                    optimizer,
+                    tau=self.cfg.token_pred_temperature,
+                    tau_prime=self.cfg.token_target_temperature,
+                    top_k=getattr(self.cfg, "token_kl_top_k", 64),
+                    lambda_token=self.cfg.lambda_token,
+                )
+            else:
+                loss, token_loss = train_predictor_only_fixed(
+                    model, g, feats, text_embeddings, optimizer
+                )
+            if token_loss is not None and token_loss < best_token_loss:
+                best_token_loss = token_loss
+                best_state = copy.deepcopy(model.state_dict())
+            if epoch % max(1, max_epoch // 5) == 0 or epoch == max_epoch:
+                log.info(
+                    "Predictor-only Ep %3d/%d | L_token=%.4f | best=%.4f",
+                    epoch,
+                    max_epoch,
+                    token_loss or 0.0,
+                    best_token_loss,
+                )
+
+        model.load_state_dict(best_state)
+        artifacts = CodebookArtifacts(
+            encoder_state_dict=best_state,
+            codebook_embeddings=old.codebook_embeddings,
+            semantic_centers=old.semantic_centers,
+            node_code_assignments=old.node_code_assignments,
+            save_dir=output_dir,
+        )
+        self.save_artifacts(artifacts, output_dir, train_conf=conf)
+        log.info(
+            "Predictor-only done. best L_token=%.4f. Artifacts: %s",
+            best_token_loss,
+            output_dir,
+        )
         return artifacts
 
     @staticmethod
@@ -393,8 +693,18 @@ class CodebookTrainer:
         cfg_snap = {
             "lambda_semantic": self.cfg.lambda_semantic,
             "warmup_epochs": self.cfg.warmup_epochs,
+            "tfidf_stats_min_epoch": getattr(self.cfg, "tfidf_stats_min_epoch", None),
             "ema_beta": self.cfg.ema_beta,
             "codebook_size": self.cfg.codebook_size,
+            "enable_token_predictor": self.cfg.enable_token_predictor,
+            "lambda_token": self.cfg.lambda_token,
+            "token_pred_temperature": self.cfg.token_pred_temperature,
+            "token_target_temperature": self.cfg.token_target_temperature,
+            "token_kl_top_k": getattr(self.cfg, "token_kl_top_k", 0),
+            "token_predictor_type": getattr(self.cfg, "token_predictor_type", "linear"),
+            "p_code_normalize": getattr(self.cfg, "p_code_normalize", "none"),
+            "lambda_pred": self.cfg.lambda_pred,
+            "text_vocab_size": self.cfg.text_vocab_size,
         }
         with open(save_dir / "config.json", "w", encoding="utf-8") as f:
             json.dump(cfg_snap, f, indent=2)

@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model_config_path", type=str, default="./train.conf.yaml")
     p.add_argument("--lambda_semantic", type=float, default=None)
     p.add_argument("--warmup_epochs", type=int, default=None)
+    p.add_argument(
+        "--tfidf_stats_min_epoch",
+        type=int,
+        default=None,
+        help="仅 epoch >= 此值时更新 best checkpoint 并统计 TF-IDF（默认 warmup_epochs+1）",
+    )
     p.add_argument("--codebook_size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--patience", type=int, default=50)
@@ -63,7 +69,74 @@ def parse_args() -> argparse.Namespace:
         "--tokenbook_dir",
         type=str,
         default="./codebook",
-        help="预置文本 tokenbook 目录（--compute_tfidf / --tfidf_only 时使用）",
+        help="预置文本 tokenbook 目录（训练 token 预测头 / TF-IDF 时使用）",
+    )
+    p.add_argument("--lambda_token", type=float, default=None, help="Token KL 损失权重 α")
+    p.add_argument(
+        "--token_pred_temperature",
+        type=float,
+        default=None,
+        help="预测分布温度 τ",
+    )
+    p.add_argument(
+        "--token_target_temperature",
+        type=float,
+        default=None,
+        help="目标分布温度 τ'",
+    )
+    p.add_argument(
+        "--token_kl_top_k",
+        type=int,
+        default=None,
+        help="Top-K KL（0=全词表）",
+    )
+    p.add_argument(
+        "--token_predictor_type",
+        type=str,
+        default=None,
+        choices=["linear", "factorized"],
+        help="Token 预测头类型",
+    )
+    p.add_argument(
+        "--p_code_normalize",
+        type=str,
+        default=None,
+        choices=["none", "max", "minmax"],
+        help="推理时 P_code 归一化方式",
+    )
+    p.add_argument(
+        "--load_checkpoint",
+        type=str,
+        default=None,
+        help="从已有 model.pth 初始化权重",
+    )
+    p.add_argument(
+        "--init_from_dir",
+        type=str,
+        default=None,
+        help="predictor_only 时复用该目录的码本/node_codes",
+    )
+    p.add_argument(
+        "--predictor_only",
+        action="store_true",
+        help="冻结 VQ，仅训练 token_predictor（E5 ablation）",
+    )
+    p.add_argument(
+        "--predictor_only_epochs",
+        type=int,
+        default=None,
+        help="predictor_only 训练 epoch 数",
+    )
+    p.add_argument(
+        "--predictor_lr",
+        type=float,
+        default=1e-3,
+        help="predictor_only 学习率",
+    )
+    p.add_argument(
+        "--no_token_predictor",
+        action="store_true",
+        help="禁用 Token 预测辅助任务",
     )
     p.add_argument("--console_log", action="store_true")
     p.add_argument(
@@ -87,6 +160,8 @@ def main() -> None:
         cfg.lambda_semantic = args.lambda_semantic
     if args.warmup_epochs is not None:
         cfg.warmup_epochs = args.warmup_epochs
+    if args.tfidf_stats_min_epoch is not None:
+        cfg.tfidf_stats_min_epoch = args.tfidf_stats_min_epoch
     if args.codebook_size is not None:
         cfg.codebook_size = args.codebook_size
     if args.epochs is not None:
@@ -97,10 +172,33 @@ def main() -> None:
         cfg.data_source = None if args.data_source == "auto" else args.data_source
     if args.node_text_csv:
         cfg.node_text_csv = Path(args.node_text_csv)
+    if args.lambda_token is not None:
+        cfg.lambda_token = args.lambda_token
+    if args.token_pred_temperature is not None:
+        cfg.token_pred_temperature = args.token_pred_temperature
+    if args.token_target_temperature is not None:
+        cfg.token_target_temperature = args.token_target_temperature
+    if args.token_kl_top_k is not None:
+        cfg.token_kl_top_k = args.token_kl_top_k
+    if args.token_predictor_type is not None:
+        cfg.token_predictor_type = args.token_predictor_type
+    if args.p_code_normalize is not None:
+        cfg.p_code_normalize = args.p_code_normalize
+    if args.predictor_only_epochs is not None:
+        cfg.predictor_only_epochs = args.predictor_only_epochs
+    if args.no_token_predictor:
+        cfg.enable_token_predictor = False
+
+    tokenbook_vocab = Path(args.tokenbook_dir) / cfg.tokenbook_vocab_filename
+    if cfg.enable_token_predictor and cfg.lambda_token > 0 and not args.tfidf_only:
+        if not tokenbook_vocab.exists():
+            raise FileNotFoundError(
+                f"Token predictor enabled but vocabulary not found: {tokenbook_vocab}"
+            )
 
     set_seed(args.seed)
     output_dir = Path(args.output_dir) / args.dataset / args.teacher / f"seed_{args.seed}"
-    check_writable(output_dir, overwrite=args.tfidf_only)
+    check_writable(output_dir, overwrite=False)
     setup_logging(__name__, log_file=output_dir / "train_codebook.log")
     if args.console_log:
         logging.getLogger(__name__).setLevel(logging.INFO)
@@ -162,6 +260,25 @@ def main() -> None:
         conf["patience"] = args.patience
         conf["seed"] = args.seed
         conf["dataset"] = args.dataset
+        conf["tokenbook_dir"] = args.tokenbook_dir
+        if cfg.tfidf_stats_min_epoch is not None:
+            conf["tfidf_stats_min_epoch"] = cfg.tfidf_stats_min_epoch
+        if args.load_checkpoint:
+            conf["load_checkpoint"] = args.load_checkpoint
+        if args.init_from_dir:
+            conf["init_from_dir"] = args.init_from_dir
+        if args.predictor_only:
+            conf["predictor_only"] = True
+            conf["predictor_only_epochs"] = (
+                args.predictor_only_epochs or cfg.predictor_only_epochs
+            )
+            conf["predictor_lr"] = args.predictor_lr
+            if not args.load_checkpoint and not args.init_from_dir:
+                raise ValueError(
+                    "predictor_only requires --load_checkpoint or --init_from_dir"
+                )
+            if args.load_checkpoint and not args.init_from_dir:
+                conf["init_from_dir"] = str(Path(args.load_checkpoint).parent)
 
         trainer = CodebookTrainer(cfg)
         artifacts = trainer.fit(

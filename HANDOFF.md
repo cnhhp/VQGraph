@@ -59,10 +59,10 @@ Host vqgraph-gpu
 
 | 模块 | 状态 | 要点 |
 |------|------|------|
-| **1 结构码本** | ✅ 已用文本 Cora 重训 | `outputs/codebook/cora/GCN/seed_0/`；best epoch 98，val≈0.73，test≈0.745；含 TF-IDF |
+| **1 结构码本** | ✅ + Token 预测辅助 | 语义偏置 VQ + **token_predictor**（KL 监督）；推理融合 `P_code` |
 | **GCN 分类基线** | ✅ 脚本就绪 | `train_gcn_baseline.py` → `outputs/baseline_gcn/cora/seed_0/baseline_metrics.json`（无 VQ，仅 CE） |
 | **2 子图** | ✅ | `SubgraphExtractor`，默认 k=1 |
-| **3 节点离散化** | ✅ | TF-IDF + MMR + **选词阶段停用词**（`graph_utils.ENGLISH_STOPWORDS`，词表不变） |
+| **3 节点离散化** | ✅ | TF-IDF + **P_code（token_predictor）** + MMR + 选词阶段停用词 |
 | **4 序列化** | ✅ | `BiasedEulerSerializer`；α/β/γ=0.4/0.3/0.3 |
 | **TextTokenbook** | ✅ | `codebook/filtered_tokenbook.npy`，V=13648 |
 | **preprocess_data** | ✅ 全量 JSONL | `data/llm_finetune/` 140/500/1000；`manifest.json` |
@@ -73,6 +73,10 @@ Host vqgraph-gpu
 ## 5. 关键配置（`config.py`，阶段 A+B 默认）
 
 ```text
+# 模块1 — Token 预测辅助（默认开启）
+enable_token_predictor=True, lambda_token=0.05, token_pred_temperature=1.0
+token_target_temperature=0.15, lambda_pred=0.5
+
 # 阶段 B — 序列化
 subgraph_k_hop=2, top_k_text_tokens=8, mmr_candidate_pool=96
 
@@ -83,6 +87,17 @@ qlora_epochs=2, warmup_ratio=0.06, max_seq_length=768
 # 其它
 tokenbook: filtered_tokenbook.npy, lambda_tfidf=0.5, batch=4, grad_accum=2
 ```
+
+**损失（模块 1）：** `L_total = L_recon + L_commit + α·L_token`（`L_token = KL(P_target ‖ P_pred)`，P_target 来自 SBERT 余弦相似度）
+
+**推理融合（模块 3）：** `score[t] = text_sim[t] × (1 + λ_tfidf·TF-IDF + λ_pred·P_code[t])`
+
+**TF-IDF 统计时机：** 默认仅在 `epoch >= warmup_epochs + 1` 后更新 best checkpoint 并分配 node_codes 做 TF-IDF（warmup 阶段码分配不稳定，不参与统计）。可调 `--tfidf_stats_min_epoch`。
+
+**重训 checklist（启用 token_predictor 后）：**
+1. `train_codebook.py`（需 `codebook/filtered_tokenbook.npy`）
+2. `--compute_tfidf` 重算 TF-IDF
+3. `preprocess_data.py` 重生成 JSONL
 
 **v1 旧数据（k=1, top_k=5）：** `data/llm_finetune/`（仍可用于对比）  
 **v2 新数据（k=2, top_k=8）：** 需用当前 config 重跑 `preprocess_data.py` → `data/llm_finetune_v2/`
@@ -144,10 +159,14 @@ python finetune_llm.py ... --base_model Qwen/Qwen2.5-0.5B-Instruct --mode lora \
 ## 8. 常用命令
 
 ```bash
-# 模块1 重训码本（文本 Cora）
+# 模块1 重训码本（文本 Cora，含 Token 预测辅助任务）
 python train_codebook.py --dataset cora --data_root ./data --data_source text \
   --tokenbook_dir ./codebook --warmup_epochs 20 --lambda_semantic 0.1 \
+  --lambda_token 0.05 --token_target_temperature 0.15 \
   --compute_tfidf --seed 0 --device 0 --console_log
+
+# 禁用 Token 预测（与旧版行为一致）
+python train_codebook.py ... --no_token_predictor
 
 # 仅重算 TF-IDF
 python train_codebook.py --tfidf_only --dataset cora --data_root ./data \
@@ -254,6 +273,7 @@ python finetune_llm.py \
 | `config.py` | 全局超参 |
 | `graph_utils.py` | `load_graph_data`、`load_text_dgl_dataset`、`resolve_node_class_name`、停用词 |
 | `train_codebook.py` | 模块1 入口 |
+| `models/token_predictor.py` | Token 预测头 + KL 损失 |
 | `preprocess_data.py` | JSONL 主流水线 |
 | `models/node_representation.py` | MMR + TF-IDF 选词 |
 | `models/serialization.py` | 模块4 |

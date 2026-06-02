@@ -37,12 +37,23 @@ class Config:
     gnn_type: str = "GCN"  # GCN | SAGE
     lambda_semantic: float = 0.1
     warmup_epochs: int = 20
+    tfidf_stats_min_epoch: Optional[int] = None  # None → warmup_epochs+1；此前 epoch 不参与 best/TF-IDF
     ema_beta: float = 0.99  # 语义中心 μ_k 的 EMA 衰减
     codebook_train_epochs: int = 100
     codebook_lr: float = 1e-3
     codebook_batch_size: int = -1  # -1 表示全图
     use_contrastive_loss: bool = False
     contrastive_weight: float = 0.1
+    # Token 预测辅助任务（模块1 训练 + 模块3 推理融合）
+    enable_token_predictor: bool = True
+    lambda_token: float = 0.05  # α：KL 损失权重
+    token_pred_temperature: float = 1.0  # τ：预测分布温度
+    token_target_temperature: float = 0.15  # τ'：目标分布温度
+    token_kl_top_k: int = 0  # Top-K KL；0=全词表
+    token_predictor_type: str = "linear"  # linear | factorized
+    p_code_normalize: str = "max"  # none | max | minmax
+    lambda_pred: float = 0.05  # 推理时 P_code 融合强度（E4 sweep 最佳）
+    predictor_only_epochs: int = 15  # 冻结 VQ 时仅训 predictor 的 epoch 数
 
     # ---------- 模块2：子图提取 ----------
     subgraph_k_hop: int = 2  # 阶段 B：1→2 hop，丰富结构上下文

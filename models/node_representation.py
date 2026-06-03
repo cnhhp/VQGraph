@@ -10,7 +10,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import Config, get_config
-from graph_utils import mask_stopwords_in_scores
+from graph_utils import build_selection_valid_mask, mask_tokens_for_selection
 from models.codebook_trainer import (
     CodebookTrainer,
     TFIDFComputer,
@@ -31,6 +31,13 @@ from models.token_predictor import (
     FactorizedTokenPredictor,
     TokenPredictorHead,
     compute_p_code,
+)
+from models.token_selector import (
+    TokenSelector,
+    build_tfidf_table,
+    compute_initial_scores_numpy,
+    load_token_selector,
+    mask_scores_to_candidate_pool,
 )
 
 Model = load_root_models_module().Model
@@ -146,8 +153,8 @@ class NodeRepresentationTokenizer:
     对子图中每个节点生成 text_tokens + struct_token。
 
     文本筛选::
-        score[t] = text_sim[t] * (1 + λ_tfidf * TF-IDF_norm[c][t] + λ_pred * P_code[t])
-        再用 MMR（select_diverse_tokens）从 scores 中选出 K 个多样 token。
+        s0[t] = text_sim[t] * (1 + λ_tfidf * TF-IDF_norm[c][t] + λ_pred * P_code[t])
+        可选 TokenSelector 重排 s0 -> s；再用 MMR 选出 K 个多样 token。
     未见结构码 / 无 TF-IDF / 无 token_predictor 时退化为纯 text_sim。
     """
 
@@ -158,17 +165,44 @@ class NodeRepresentationTokenizer:
         tfidf: Optional[TFIDFStatistics] = None,
         cfg: Optional[Config] = None,
         model_conf: Optional[Dict[str, Any]] = None,
+        token_selector: Optional[TokenSelector] = None,
     ) -> None:
         self.cfg = cfg or get_config()
         self.artifacts = artifacts
         self.tokenbook = tokenbook
         self.tfidf = tfidf
         self.model_conf = model_conf
+        self.token_selector = token_selector
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.encoder: Optional[nn.Module] = None
         self._struct_dist_cache: Optional[torch.Tensor] = None
+        self._tfidf_table: Optional[torch.Tensor] = None
+
+    @classmethod
+    def from_token_selector_checkpoint(
+        cls,
+        artifacts: CodebookArtifacts,
+        tokenbook: TextTokenbook,
+        checkpoint_path: Union[str, Path],
+        tfidf: Optional[TFIDFStatistics] = None,
+        cfg: Optional[Config] = None,
+        model_conf: Optional[Dict[str, Any]] = None,
+        device: Optional[torch.device] = None,
+    ) -> "NodeRepresentationTokenizer":
+        dev = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        selector = load_token_selector(checkpoint_path, dev)
+        return cls(
+            artifacts=artifacts,
+            tokenbook=tokenbook,
+            tfidf=tfidf,
+            cfg=cfg,
+            model_conf=model_conf,
+            token_selector=selector,
+        )
 
     def _resolve_train_conf(self) -> Dict[str, Any]:
         if self.model_conf is not None:
@@ -306,6 +340,54 @@ class NodeRepresentationTokenizer:
         self._struct_dist_cache = dist
         return dist
 
+    def _ensure_tfidf_table(self) -> torch.Tensor:
+        if self._tfidf_table is not None:
+            return self._tfidf_table
+        num_codes = self.artifacts.codebook_embeddings.shape[0]
+        vocab_size = len(self.tokenbook.token_to_id)
+        self._tfidf_table = build_tfidf_table(
+            self.tfidf,
+            self.tokenbook.token_to_id,
+            num_codes,
+            vocab_size,
+            self.device,
+        )
+        return self._tfidf_table
+
+    def _get_predictor(self) -> Optional[nn.Module]:
+        if self.cfg.lambda_pred <= 0:
+            return None
+        model = self.load_encoder()
+        return getattr(model.encoder, "token_predictor", None)
+
+    def _get_tokenbook_emb_for_scores(self) -> torch.Tensor:
+        model = self.load_encoder()
+        tokenbook_emb = getattr(model.encoder, "tokenbook_embeddings", None)
+        if tokenbook_emb is not None:
+            return tokenbook_emb
+        return self.tokenbook.get_embedding_matrix().to(self.device)
+
+    def _compute_initial_scores(
+        self,
+        node_text_emb: torch.Tensor,
+        struct_code_idx: int,
+    ) -> np.ndarray:
+        """统一初始得分 s0（text_sim + TF-IDF + P_code）。"""
+        code_vec = self.artifacts.codebook_embeddings[struct_code_idx]
+        return compute_initial_scores_numpy(
+            node_text_emb=node_text_emb,
+            struct_code_idx=struct_code_idx,
+            tokenbook_emb=self._get_tokenbook_emb_for_scores(),
+            tfidf_table=self._ensure_tfidf_table(),
+            code_vectors=code_vec,
+            predictor=self._get_predictor(),
+            lambda_tfidf=self.cfg.lambda_tfidf,
+            lambda_pred=self.cfg.lambda_pred,
+            token_pred_tau=self.cfg.token_pred_temperature,
+            p_code_normalize=getattr(self.cfg, "p_code_normalize", "none"),
+            device=self.device,
+        )
+
     def _compute_text_similarity(
         self,
         node_text_emb: torch.Tensor,
@@ -407,32 +489,11 @@ class NodeRepresentationTokenizer:
 
     def _fuse_scores(
         self,
-        text_sim: np.ndarray,
+        node_text_emb: torch.Tensor,
         struct_code_idx: int,
-        p_code: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """
-        score[t] = text_sim[t] * (1 + λ_tfidf * prior[t] + λ_pred * P_code[t])；
-        无 TF-IDF / P_code 时对应项为 0。
-        """
-        prior = self._align_tfidf_row(struct_code_idx)
-        if p_code is None:
-            p_code = self._compute_p_code(struct_code_idx)
-
-        lam_tfidf = self.cfg.lambda_tfidf
-        lam_pred = self.cfg.lambda_pred
-        has_prior = prior.max() >= 1e-8
-        has_p_code = lam_pred > 0 and p_code.max() >= 1e-8
-
-        if not has_prior and not has_p_code:
-            return text_sim
-
-        multiplier = np.ones_like(text_sim, dtype=np.float64)
-        if has_prior:
-            multiplier = multiplier + lam_tfidf * prior
-        if has_p_code:
-            multiplier = multiplier + lam_pred * p_code
-        return text_sim * multiplier
+        """score[t] = text_sim[t] * (1 + λ_tfidf * prior[t] + λ_pred * P_code[t])。"""
+        return self._compute_initial_scores(node_text_emb, struct_code_idx)
 
     def select_text_tokens(
         self,
@@ -452,20 +513,49 @@ class NodeRepresentationTokenizer:
         if vocab_size == 0:
             return [], []
 
-        text_sim = self._compute_text_similarity(node_text_emb)
-        scores = self._fuse_scores(text_sim, struct_code_idx)
+        scores = self._compute_initial_scores(node_text_emb, struct_code_idx)
+
+        if self.token_selector is not None:
+            book_emb = self._get_tokenbook_emb_for_scores()
+            sel_device = next(self.token_selector.parameters()).device
+            s0_t = torch.tensor(scores, dtype=torch.float32, device=sel_device).unsqueeze(0)
+            book_emb = book_emb.to(sel_device)
+            candidate_pool = int(
+                getattr(
+                    self.token_selector,
+                    "candidate_pool",
+                    getattr(self.cfg, "token_selector_candidate_pool", 256),
+                )
+            )
+            self.token_selector.eval()
+            with torch.no_grad():
+                adjusted = self.token_selector(s0_t, book_emb).squeeze(0)
+                adjusted = mask_scores_to_candidate_pool(
+                    adjusted.unsqueeze(0),
+                    s0_t,
+                    candidate_pool,
+                ).squeeze(0)
+            scores = adjusted.cpu().numpy()
+
         k = min(k, vocab_size)
 
         selection_scores = scores
-        if getattr(self.cfg, "filter_stopwords_at_selection", True):
-            id_to_token = self.tokenbook.id_to_token
-            masked, n_masked = mask_stopwords_in_scores(scores, id_to_token)
+        id_to_token = self.tokenbook.id_to_token
+        filter_stop = getattr(self.cfg, "filter_stopwords_at_selection", True)
+        filter_noise = getattr(self.cfg, "filter_noise_subwords_at_selection", True)
+        if filter_stop or filter_noise:
+            masked, n_masked = mask_tokens_for_selection(
+                scores,
+                id_to_token,
+                filter_stopwords=filter_stop,
+                filter_noise_subwords=filter_noise,
+            )
             n_valid = int((masked > -1e11).sum())
             if n_valid >= k:
                 selection_scores = masked
             else:
                 logger.warning(
-                    "Too few non-stopword candidates (%d < k=%d); "
+                    "Too few valid candidates after filtering (%d < k=%d); "
                     "fallback to unfiltered scores.",
                     n_valid,
                     k,
@@ -654,9 +744,10 @@ def _run_smoke_test(args: argparse.Namespace) -> None:
     logger.info("Subgraph nodes tokenized: %d", len(view.nodes))
 
     if args.test_fuse_fallback:
-        sim = np.random.rand(len(tokenbook)).astype(np.float64)
-        fused = tokenizer._fuse_scores(sim, struct_code_idx=999999)
-        np.testing.assert_array_equal(fused, sim)
+        dummy_emb = text_emb[args.node]
+        fused = tokenizer._fuse_scores(dummy_emb, struct_code_idx=999999)
+        base = tokenizer._compute_text_similarity(dummy_emb)
+        np.testing.assert_array_almost_equal(fused, base)
         logger.info("TF-IDF fallback on invalid code: OK")
 
 

@@ -86,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "max", "minmax"],
         help="推理时 P_code 归一化方式",
     )
+    p.add_argument(
+        "--token_selector_checkpoint",
+        type=str,
+        default=None,
+        help="可选：训练好的 TokenSelector checkpoint（best.pth）",
+    )
     return p.parse_args()
 
 
@@ -139,12 +145,25 @@ def build_pipeline(
     if args.k is not None:
         cfg.subgraph_k_hop = args.k
 
+    if args.p_code_normalize is not None:
+        cfg.p_code_normalize = args.p_code_normalize
+    if args.token_selector_checkpoint:
+        cfg.token_selector_checkpoint = Path(args.token_selector_checkpoint)
+
     extractor = SubgraphExtractor(cfg)
+    token_selector = None
+    if getattr(cfg, "token_selector_checkpoint", None):
+        from models.token_selector import load_token_selector
+
+        token_selector = load_token_selector(cfg.token_selector_checkpoint, device)
+        logger.info("Loaded TokenSelector from %s", cfg.token_selector_checkpoint)
+
     tokenizer = NodeRepresentationTokenizer(
         artifacts=artifacts,
         tokenbook=tokenbook,
         tfidf=tfidf,
         cfg=cfg,
+        token_selector=token_selector,
     )
     serializer = BiasedEulerSerializer(cfg)
 
@@ -300,6 +319,11 @@ def main() -> None:
             "lambda_pred": cfg.lambda_pred,
             "p_code_normalize": cfg.p_code_normalize,
             "lambda_tfidf": cfg.lambda_tfidf,
+            "token_selector_checkpoint": (
+                str(cfg.token_selector_checkpoint)
+                if getattr(cfg, "token_selector_checkpoint", None)
+                else None
+            ),
         },
         "splits": {},
     }

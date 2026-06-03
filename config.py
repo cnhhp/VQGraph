@@ -66,7 +66,22 @@ class Config:
     mmr_lambda: float = 0.5  # MMR 相关性权重，越大越偏向高分 token
     mmr_candidate_pool: int = 96  # 阶段 B：配合更大的 top_k
     filter_stopwords_at_selection: bool = True  # 选词时屏蔽停用词（词表不变）
+    filter_noise_subwords_at_selection: bool = True  # 选词时屏蔽 PDF/子词噪声
     struct_token_prefix: str = "<S_"
+
+    # ---------- 模块3b：可学习 TokenSelector ----------
+    token_selector_hidden_dim: int = 128
+    token_selector_lr: float = 1e-3
+    token_selector_epochs: int = 50
+    token_selector_batch_size: int = 32
+    gumbel_tau_init: float = 1.0
+    gumbel_tau_min: float = 0.5
+    gumbel_tau_anneal_epochs: int = 30
+    token_selector_candidate_pool: int = 128  # Gumbel / 推理仅在 s0 Top-K 候选池内
+    token_selector_kl_weight: float = 0.3  # KL(w || softmax(s0))，防止偏离初始得分
+    token_selector_entropy_weight: float = 0.01  # 最大化选择熵，缓解模式坍缩
+    token_selector_vtext_dropout: float = 0.3  # 训练时对 v_text dropout，迫使分类头依赖文本
+    token_selector_checkpoint: Optional[Path] = None
 
     # ---------- 模块4：序列化 ----------
     bias_alpha: float = 0.4

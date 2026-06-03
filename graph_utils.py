@@ -444,6 +444,119 @@ def mask_stopwords_in_scores(
     return masked, n_masked
 
 
+# 短 token 白名单（CS/ML 常见缩写，不受长度限制）
+ML_SHORT_WHITELIST: frozenset = frozenset(
+    {
+        "ml", "ai", "nn", "bay", "pac", "sql", "gpu", "cpu", "ram", "xml",
+        "gan", "svm", "knn", "cnn", "rnn", "nlp", "api", "mlp", "gcn",
+    }
+)
+
+# PDF 解析 / 子词切分已知噪声（HANDOFF + 实验观测）
+KNOWN_NOISE_SUBWORDS: frozenset = frozenset(
+    {
+        "onian", "sku", "oston", "aku", "kou", "oni", "ruguay", "onie",
+        "minipage", "episodio", "denn", "dign", "konn", "lun", "cin", "conn",
+        "ljen", "seinen", "tain", "ven", "dann", "lassen", "rinn", "unn",
+        "finden", "prede", "annon", "sar", "ggi", "ippi", "dotnet", "vo",
+        "svn", "svo", "rinn", "kou", "pap", "strateg", "militaire",
+        "programma", "automat", "itories", "voll", "punkt", "locomot",
+        "phantom", "laten", "autonom", "denn", "emb", "emes", "embar",
+        "emberg", "emes", "emple", "ema", "embro", "empt", "manuel",
+    }
+)
+
+
+def is_noise_subword(token: str) -> bool:
+    """
+    判断 token 是否为 tokenbook 噪声子词（PDF 残留、德语片段、无意义短词）。
+
+    仅用于选词阶段过滤，不修改词表。
+    """
+    w = str(token).lower().strip()
+    if not w:
+        return True
+    if not w.isalpha():
+        return True
+    if w in ML_SHORT_WHITELIST:
+        return False
+    if w in KNOWN_NOISE_SUBWORDS:
+        return True
+    if len(w) <= 3:
+        return True
+    if len(w) == 4:
+        vowels = sum(c in "aeiou" for c in w)
+        if vowels == 0:
+            return True
+        if vowels == 1 and w.endswith(("nn", "rn", "ln", "vn", "kn")):
+            return True
+    if len(w) <= 5 and w.endswith(("enn", "ann", "inn", "unn", "onn")):
+        return True
+    return False
+
+
+def build_selection_valid_mask(
+    id_to_token: Dict[int, str],
+    vocab_size: int,
+    *,
+    filter_stopwords: bool = False,
+    filter_noise_subwords: bool = True,
+) -> np.ndarray:
+    """返回 shape [V] 的 bool 掩码，True 表示可选 token。"""
+    valid = np.ones(vocab_size, dtype=bool)
+    for tid, tok in id_to_token.items():
+        idx = int(tid)
+        if idx < 0 or idx >= vocab_size:
+            continue
+        if filter_stopwords and is_stopword(tok):
+            valid[idx] = False
+        elif filter_noise_subwords and is_noise_subword(tok):
+            valid[idx] = False
+    return valid
+
+
+def mask_noise_subwords_in_scores(
+    scores: np.ndarray,
+    id_to_token: Dict[int, str],
+) -> Tuple[np.ndarray, int]:
+    """将噪声子词对应 score 置为极低分。"""
+    masked = np.asarray(scores, dtype=np.float64).copy()
+    n_masked = 0
+    for tid, tok in id_to_token.items():
+        idx = int(tid)
+        if idx < 0 or idx >= masked.shape[0]:
+            continue
+        if is_noise_subword(tok):
+            masked[idx] = _STOPWORD_SCORE_PENALTY
+            n_masked += 1
+    return masked, n_masked
+
+
+def mask_tokens_for_selection(
+    scores: np.ndarray,
+    id_to_token: Dict[int, str],
+    *,
+    filter_stopwords: bool = True,
+    filter_noise_subwords: bool = True,
+) -> Tuple[np.ndarray, int]:
+    """选词前统一过滤：停用词 + 噪声子词。"""
+    masked = np.asarray(scores, dtype=np.float64).copy()
+    n_masked = 0
+    for tid, tok in id_to_token.items():
+        idx = int(tid)
+        if idx < 0 or idx >= masked.shape[0]:
+            continue
+        blocked = False
+        if filter_stopwords and is_stopword(tok):
+            blocked = True
+        elif filter_noise_subwords and is_noise_subword(tok):
+            blocked = True
+        if blocked:
+            masked[idx] = _STOPWORD_SCORE_PENALTY
+            n_masked += 1
+    return masked, n_masked
+
+
 def tokenize_for_tfidf(text: str) -> List[str]:
     """简单词级 tokenizer，供 TF-IDF 统计使用。"""
     return re.findall(r"[a-zA-Z]+", text.lower())

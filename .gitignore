@@ -5,3 +5,8 @@ __pycache__/
 outputs/
 codebook/token_embeddings.npz
 codebook/tokenbook_meta.json
+
+# Large local datasets and generated JSONL (sync via scp, not git)
+data/dataset/
+data/lc_ego_graphs/
+data/llm_finetune_json/

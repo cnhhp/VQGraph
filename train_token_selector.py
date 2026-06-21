@@ -1,5 +1,8 @@
 """
-训练可学习 TokenSelector：Gumbel-Softmax 软选择 + 节点分类监督。
+训练可学习 TokenSelector。
+
+默认（方案 A）：MMR 目标分布蒸馏 + 弱分类损失。
+旧模式：``--training_mode cls`` → Gumbel + 主分类 + s0 KL。
 
 用法::
 
@@ -40,6 +43,7 @@ from models.token_selector import (
     TokenSelector,
     build_tfidf_table,
     gumbel_tau_for_epoch,
+    precompute_mmr_target_topk_indices,
     save_token_selector_checkpoint,
 )
 from text_tokenizers.text_tokenbook import TextTokenbook
@@ -74,6 +78,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kl_weight", type=float, default=None, help="KL(w||softmax(s0)) 权重")
     p.add_argument("--entropy_weight", type=float, default=None, help="选择熵正则权重")
     p.add_argument("--vtext_dropout", type=float, default=None, help="训练时 v_text dropout")
+    p.add_argument(
+        "--training_mode",
+        type=str,
+        default=None,
+        choices=["distill", "cls"],
+        help="distill=MMR 目标蒸馏（默认）；cls=旧 Gumbel+分类目标",
+    )
+    p.add_argument("--distill_weight", type=float, default=None, help="KL(P_student||P_target) 权重")
+    p.add_argument("--cls_weight", type=float, default=None, help="弱分类损失权重（distill 模式）")
+    p.add_argument(
+        "--student_temperature",
+        type=float,
+        default=None,
+        help="softmax(s_selector) 温度（distill 模式）",
+    )
     p.add_argument(
         "--data_source",
         type=str,
@@ -116,7 +135,12 @@ def _run_epoch_soft(
 
         optimizer.zero_grad()
         loss, logits, aux = trainer.forward_soft(
-            batch_text, batch_z, batch_codes, batch_labels, tau=tau
+            batch_text,
+            batch_z,
+            batch_codes,
+            batch_labels,
+            tau=tau,
+            node_indices=batch_idx,
         )
         loss.backward()
         optimizer.step()
@@ -200,6 +224,25 @@ def main() -> None:
     vtext_dropout = (
         args.vtext_dropout if args.vtext_dropout is not None else cfg.token_selector_vtext_dropout
     )
+    training_mode = args.training_mode or cfg.token_selector_training_mode
+    distill_weight = (
+        args.distill_weight
+        if args.distill_weight is not None
+        else cfg.token_selector_distill_weight
+    )
+    cls_weight = (
+        args.cls_weight if args.cls_weight is not None else cfg.token_selector_cls_weight
+    )
+    student_temperature = (
+        args.student_temperature
+        if args.student_temperature is not None
+        else cfg.token_selector_student_temperature
+    )
+    if training_mode == "distill":
+        if args.kl_weight is None:
+            kl_weight = 0.0
+        if args.entropy_weight is None:
+            entropy_weight = 0.0
 
     set_seed(args.seed)
     device = torch.device(
@@ -326,7 +369,29 @@ def main() -> None:
         entropy_weight=entropy_weight,
         vtext_dropout=vtext_dropout,
         selection_valid_mask=selection_valid_mask,
+        training_mode=training_mode,
+        distill_weight=distill_weight,
+        cls_weight=cls_weight,
+        student_temperature=student_temperature,
     ).to(device)
+
+    target_topk_indices = None
+    if training_mode == "distill":
+        num_nodes = g.num_nodes()
+        target_topk_indices = precompute_mmr_target_topk_indices(
+            trainer,
+            text_emb,
+            z_q_all,
+            struct_codes,
+            tokenbook.id_to_token,
+            num_nodes=num_nodes,
+            top_k=top_k_hard,
+            mmr_lambda=cfg.mmr_lambda,
+            mmr_candidate_pool=cfg.mmr_candidate_pool,
+            filter_stopwords=getattr(cfg, "filter_stopwords_at_selection", True),
+            filter_noise_subwords=getattr(cfg, "filter_noise_subwords_at_selection", True),
+        )
+        trainer.register_buffer("target_topk_indices", target_topk_indices)
 
     param_groups: List[Dict[str, Any]] = [
         {"params": list(token_selector.parameters()) + list(node_classifier.parameters()), "lr": lr},
@@ -346,18 +411,26 @@ def main() -> None:
     history: List[List[float]] = []
 
     logger.info(
-        "Train TokenSelector: N=%d V=%d train=%d val=%d device=%s "
-        "pool=%d kl=%.3f ent=%.3f vtext_drop=%.2f",
+        "Train TokenSelector: N=%d V=%d train=%d val=%d device=%s mode=%s "
+        "pool=%d distill=%.3f cls=%.3f student_t=%.2f",
         g.num_nodes(),
         vocab_size,
         len(idx_train),
         len(idx_val),
         device,
+        training_mode,
         candidate_pool,
-        kl_weight,
-        entropy_weight,
-        vtext_dropout,
+        distill_weight,
+        cls_weight,
+        student_temperature,
     )
+    if training_mode == "cls":
+        logger.info(
+            "cls mode extras: kl=%.3f ent=%.3f vtext_drop=%.2f",
+            kl_weight,
+            entropy_weight,
+            vtext_dropout,
+        )
 
     for epoch in range(1, epochs + 1):
         tau = gumbel_tau_for_epoch(epoch, tau_init, tau_min, anneal_epochs)
@@ -382,20 +455,36 @@ def main() -> None:
             batch_size,
         )
         history.append([epoch, train_loss, train_acc, val_loss, val_acc, tau])
-        kl_log = train_aux.get("kl_loss", 0.0)
-        ent_log = train_aux.get("entropy", 0.0)
-        logger.info(
-            "Ep %3d | tau=%.3f | train loss %.4f acc %.4f kl %.4f ent %.3f | "
-            "val loss %.4f acc %.4f",
-            epoch,
-            tau,
-            train_loss,
-            train_acc,
-            kl_log,
-            ent_log,
-            val_loss,
-            val_acc,
-        )
+        if training_mode == "distill":
+            distill_log = train_aux.get("distill_loss", 0.0)
+            cls_log = train_aux.get("cls_loss", 0.0)
+            logger.info(
+                "Ep %3d | tau=%.3f | train loss %.4f acc %.4f "
+                "distill %.4f cls %.4f | val loss %.4f acc %.4f",
+                epoch,
+                tau,
+                train_loss,
+                train_acc,
+                distill_log,
+                cls_log,
+                val_loss,
+                val_acc,
+            )
+        else:
+            kl_log = train_aux.get("kl_loss", 0.0)
+            ent_log = train_aux.get("entropy", 0.0)
+            logger.info(
+                "Ep %3d | tau=%.3f | train loss %.4f acc %.4f kl %.4f ent %.3f | "
+                "val loss %.4f acc %.4f",
+                epoch,
+                tau,
+                train_loss,
+                train_acc,
+                kl_log,
+                ent_log,
+                val_loss,
+                val_acc,
+            )
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
             best_state = copy.deepcopy(token_selector.state_dict())
@@ -433,6 +522,10 @@ def main() -> None:
         "kl_weight": kl_weight,
         "entropy_weight": entropy_weight,
         "vtext_dropout": vtext_dropout,
+        "training_mode": training_mode,
+        "distill_weight": distill_weight,
+        "cls_weight": cls_weight,
+        "student_temperature": student_temperature,
         "filter_noise_subwords_at_selection": cfg.filter_noise_subwords_at_selection,
         "codebook_dir": str(codebook_dir),
         "tokenbook_path": str(args.tokenbook_path),
@@ -459,6 +552,10 @@ def main() -> None:
             "kl_weight": kl_weight,
             "entropy_weight": entropy_weight,
             "vtext_dropout": vtext_dropout,
+            "training_mode": training_mode,
+            "distill_weight": distill_weight,
+            "cls_weight": cls_weight,
+            "student_temperature": student_temperature,
             "train_predictor": args.train_predictor,
         },
     }

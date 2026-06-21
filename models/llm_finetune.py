@@ -28,6 +28,50 @@ DEFAULT_INSTRUCTION = (
     "(degree + PageRank + semantic similarity)"
 )
 
+INSTRUCTION_PCODE_STRUCT_SUPPLEMENT = (
+    "You are given a subgraph of a citation network, centered at a target node.\n"
+    "Format:\n"
+    "- Each line: <level> <structure_token> [text_tokens]\n"
+    "- structure_token: <S_k|w1,w2,...> — k is the structural code index; "
+    "words after | are top semantic tokens predicted from the codebook (P_code)\n"
+    "- level 0 = target node, level 1 = direct neighbor, level 2 = two-hop neighbor\n"
+    "- Nodes under the same parent are sorted by structural importance "
+    "(degree + PageRank + semantic similarity)"
+)
+
+INSTRUCTION_PCODE_STRUCT_REPLACE = (
+    "You are given a subgraph of a citation network, centered at a target node.\n"
+    "Format:\n"
+    "- Each line: <level> [struct: w1, w2, ...] [text_tokens]\n"
+    "- [struct: ...] lists top semantic tokens from the structural codebook (P_code) "
+    "for that node; [text_tokens] are content keywords from the paper text\n"
+    "- level 0 = target node, level 1 = direct neighbor, level 2 = two-hop neighbor\n"
+    "- Nodes under the same parent are sorted by structural importance "
+    "(degree + PageRank + semantic similarity)"
+)
+
+INSTRUCTION_STRUCT_SUMMARY = (
+    "You are given a subgraph of a citation network, centered at a target node.\n"
+    "Format:\n"
+    "- First line: [struct_summary: ...] — center structural code with P_code keywords "
+    "and structural-code counts in the subgraph (one summary only)\n"
+    "- Each following line: <level> <structure_token> [text_tokens]\n"
+    "- level 0 = target node, level 1 = direct neighbor, level 2 = two-hop neighbor\n"
+    "- Nodes under the same parent are sorted by structural importance "
+    "(degree + PageRank + semantic similarity)"
+)
+
+
+def instruction_for_struct_mode(mode: str) -> str:
+    """按 struct_token_mode 返回匹配的 instruction 模板。"""
+    if mode == "pcode_supplement":
+        return INSTRUCTION_PCODE_STRUCT_SUPPLEMENT
+    if mode == "pcode_replace":
+        return INSTRUCTION_PCODE_STRUCT_REPLACE
+    if mode == "struct_summary":
+        return INSTRUCTION_STRUCT_SUMMARY
+    return DEFAULT_INSTRUCTION
+
 
 class QLoRANotAvailableError(RuntimeError):
     """QLoRA 所需依赖或硬件不可用。"""

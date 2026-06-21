@@ -575,9 +575,96 @@ class NodeRepresentationTokenizer:
         ids = [int(i) for i in top_ids]
         return tokens, ids
 
-    def format_struct_token(self, code_idx: int) -> str:
+    def select_pcode_struct_tokens(
+        self,
+        struct_code_idx: int,
+        top_k: Optional[int] = None,
+    ) -> List[str]:
+        """从 P_code 分布取 top-k 可读词（过滤停用词/噪声）。"""
+        k = top_k or int(getattr(self.cfg, "p_code_struct_top_k", 3))
+        k = max(1, k)
+        p = self._compute_p_code(struct_code_idx)
+        id_to_token = self.tokenbook.id_to_token
+        filter_stop = getattr(self.cfg, "filter_stopwords_at_selection", True)
+        filter_noise = getattr(self.cfg, "filter_noise_subwords_at_selection", True)
+        if filter_stop or filter_noise:
+            masked, n_valid = mask_tokens_for_selection(
+                p,
+                id_to_token,
+                filter_stopwords=filter_stop,
+                filter_noise_subwords=filter_noise,
+            )
+            if n_valid >= k:
+                p = masked
+        top_ids = np.argsort(-p)[:k]
+        tokens: List[str] = []
+        for idx in top_ids:
+            tok = id_to_token.get(int(idx))
+            if tok and float(p[int(idx)]) > -1e10:
+                tokens.append(tok)
+        return tokens[:k]
+
+    def format_struct_token_with_pcode(self, code_idx: int) -> str:
+        """<S_k|w1,w2,...> 格式（用于 summary 等单行展示）。"""
         prefix = self.cfg.struct_token_prefix
-        return f"{prefix}{code_idx}>"
+        id_token = f"{prefix}{code_idx}>"
+        pcode_words = self.select_pcode_struct_tokens(code_idx)
+        if pcode_words:
+            return f"{prefix}{code_idx}|{','.join(pcode_words)}>"
+        return id_token
+
+    def build_subgraph_struct_summary(self, tokenized: SubgraphTokenizedView) -> str:
+        """
+        子图级结构摘要（仅一行）：中心码 + P_code 词 + 子图内结构码频次。
+        """
+        from collections import Counter
+
+        center_id = tokenized.center_node
+        center_repr = tokenized.nodes.get(center_id)
+        if center_repr is None or center_repr.struct_code_idx is None:
+            return "[struct_summary: center=unknown; codes=; n_nodes=0]"
+
+        prefix = self.cfg.struct_token_prefix
+        c_code = int(center_repr.struct_code_idx)
+        center_str = self.format_struct_token_with_pcode(c_code)
+
+        code_counts: Counter = Counter()
+        for repr_ in tokenized.nodes.values():
+            if repr_.struct_code_idx is not None:
+                code_counts[int(repr_.struct_code_idx)] += 1
+
+        code_parts = [
+            f"{prefix}{code}>:{cnt}" for code, cnt in code_counts.most_common(8)
+        ]
+        codes_str = ", ".join(code_parts) if code_parts else "none"
+        n_nodes = len(tokenized.nodes)
+        return (
+            f"[struct_summary: center={center_str}; "
+            f"codes={codes_str}; n_nodes={n_nodes}]"
+        )
+
+    def format_struct_token(self, code_idx: int) -> str:
+        """按 struct_token_mode 生成 LLM 可读的结构 token 字符串。"""
+        mode = getattr(self.cfg, "struct_token_mode", "id")
+        prefix = self.cfg.struct_token_prefix
+        id_token = f"{prefix}{code_idx}>"
+
+        if mode == "struct_summary":
+            return id_token
+
+        if mode == "pcode_supplement":
+            pcode_words = self.select_pcode_struct_tokens(code_idx)
+            if pcode_words:
+                return f"{prefix}{code_idx}|{','.join(pcode_words)}>"
+            return id_token
+
+        if mode == "pcode_replace":
+            pcode_words = self.select_pcode_struct_tokens(code_idx)
+            if pcode_words:
+                return "[struct: " + ", ".join(pcode_words) + "]"
+            return id_token
+
+        return id_token
 
     def tokenize_node(
         self,

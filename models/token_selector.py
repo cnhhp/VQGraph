@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -299,6 +299,113 @@ def selection_entropy(w: torch.Tensor) -> torch.Tensor:
     return -(w_safe * w_safe.log()).sum(dim=-1).mean()
 
 
+def compute_mmr_target_topk_indices(
+    scores_np: np.ndarray,
+    tokenbook_emb: torch.Tensor,
+    id_to_token: Dict[int, str],
+    top_k: int,
+    mmr_lambda: float,
+    mmr_candidate_pool: int,
+    filter_stopwords: bool = True,
+    filter_noise_subwords: bool = True,
+) -> List[int]:
+    """baseline s0 + 过滤 + MMR 硬 Top-k，与 node_representation 选词一致。"""
+    from graph_utils import mask_tokens_for_selection
+    from models.node_representation import select_diverse_tokens
+
+    selection_scores = np.asarray(scores_np, dtype=np.float64)
+    k = min(int(top_k), selection_scores.shape[0])
+    if k <= 0:
+        return []
+
+    if filter_stopwords or filter_noise_subwords:
+        masked, _ = mask_tokens_for_selection(
+            selection_scores,
+            id_to_token,
+            filter_stopwords=filter_stopwords,
+            filter_noise_subwords=filter_noise_subwords,
+        )
+        n_valid = int((masked > -1e11).sum())
+        if n_valid >= k:
+            selection_scores = masked
+
+    return select_diverse_tokens(
+        selection_scores,
+        tokenbook_emb,
+        k=k,
+        mmr_lambda=mmr_lambda,
+        candidate_pool=mmr_candidate_pool,
+    )
+
+
+def build_mmr_target_distribution(
+    topk_idx: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """MMR 硬 Top-k 均匀目标分布，shape [B, V]。"""
+    batch_size, k = topk_idx.shape
+    p_target = torch.zeros(
+        batch_size,
+        vocab_size,
+        device=topk_idx.device,
+        dtype=torch.float32,
+    )
+    if k <= 0:
+        return p_target
+    weight = 1.0 / float(k)
+    p_target.scatter_(1, topk_idx, weight)
+    return p_target
+
+
+@torch.no_grad()
+def precompute_mmr_target_topk_indices(
+    trainer: "TokenSelectionTrainer",
+    text_emb: torch.Tensor,
+    z_q_all: torch.Tensor,
+    struct_codes: torch.Tensor,
+    id_to_token: Dict[int, str],
+    num_nodes: int,
+    top_k: int,
+    mmr_lambda: float,
+    mmr_candidate_pool: int,
+    filter_stopwords: bool,
+    filter_noise_subwords: bool,
+) -> torch.Tensor:
+    """全图预计算 MMR teacher indices，shape [N, k]。"""
+    k = int(top_k)
+    indices = torch.zeros(num_nodes, k, dtype=torch.long, device=text_emb.device)
+    was_training = trainer.training
+    trainer.eval()
+    try:
+        for node_id in range(num_nodes):
+            if node_id % 500 == 0:
+                logger.info("Precomputing MMR targets: %d / %d", node_id, num_nodes)
+            s0 = trainer.compute_s0(
+                text_emb[node_id : node_id + 1],
+                struct_codes[node_id : node_id + 1],
+                z_q_all[node_id : node_id + 1],
+            )
+            ids = compute_mmr_target_topk_indices(
+                s0.squeeze(0).cpu().numpy(),
+                trainer.tokenbook_emb,
+                id_to_token,
+                top_k=k,
+                mmr_lambda=mmr_lambda,
+                mmr_candidate_pool=mmr_candidate_pool,
+                filter_stopwords=filter_stopwords,
+                filter_noise_subwords=filter_noise_subwords,
+            )
+            if not ids:
+                ids = [0] * k
+            elif len(ids) < k:
+                ids = ids + [ids[-1]] * (k - len(ids))
+            indices[node_id] = torch.tensor(ids[:k], dtype=torch.long, device=text_emb.device)
+    finally:
+        trainer.train(was_training)
+    logger.info("Precomputed MMR targets for %d nodes", num_nodes)
+    return indices
+
+
 class TokenSelectionTrainer(nn.Module):
     """TokenSelector + NodeClassifier 训练包装。"""
 
@@ -320,6 +427,11 @@ class TokenSelectionTrainer(nn.Module):
         entropy_weight: float = 0.01,
         vtext_dropout: float = 0.3,
         selection_valid_mask: Optional[torch.Tensor] = None,
+        training_mode: str = "distill",
+        distill_weight: float = 1.0,
+        cls_weight: float = 0.05,
+        student_temperature: float = 1.0,
+        target_topk_indices: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self.token_selector = token_selector
@@ -333,6 +445,8 @@ class TokenSelectionTrainer(nn.Module):
             )
         else:
             self.selection_valid_mask = None
+        if target_topk_indices is not None:
+            self.register_buffer("target_topk_indices", target_topk_indices.long())
         self.predictor = predictor
         self.lambda_tfidf = lambda_tfidf
         self.lambda_pred = lambda_pred
@@ -344,6 +458,10 @@ class TokenSelectionTrainer(nn.Module):
         self.kl_weight = float(kl_weight)
         self.entropy_weight = float(entropy_weight)
         self.vtext_dropout = float(vtext_dropout)
+        self.training_mode = str(training_mode)
+        self.distill_weight = float(distill_weight)
+        self.cls_weight = float(cls_weight)
+        self.student_temperature = float(student_temperature)
 
     def compute_s0(
         self,
@@ -387,6 +505,32 @@ class TokenSelectionTrainer(nn.Module):
         struct_code_idx: torch.Tensor,
         labels: torch.Tensor,
         tau: float,
+        node_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+        if self.training_mode == "distill":
+            return self._forward_soft_distill(
+                node_text_emb,
+                z_q,
+                struct_code_idx,
+                labels,
+                tau,
+                node_indices=node_indices,
+            )
+        return self._forward_soft_cls(
+            node_text_emb,
+            z_q,
+            struct_code_idx,
+            labels,
+            tau,
+        )
+
+    def _forward_soft_cls(
+        self,
+        node_text_emb: torch.Tensor,
+        z_q: torch.Tensor,
+        struct_code_idx: torch.Tensor,
+        labels: torch.Tensor,
+        tau: float,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         s0 = self.compute_s0(node_text_emb, struct_code_idx, z_q)
         s = self.token_selector(s0, self.tokenbook_emb)
@@ -412,6 +556,45 @@ class TokenSelectionTrainer(nn.Module):
             aux["entropy"] = float(ent.item())
 
         aux["total_loss"] = float(loss.item())
+        return loss, logits, aux
+
+    def _forward_soft_distill(
+        self,
+        node_text_emb: torch.Tensor,
+        z_q: torch.Tensor,
+        struct_code_idx: torch.Tensor,
+        labels: torch.Tensor,
+        tau: float,
+        node_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+        if not hasattr(self, "target_topk_indices") or self.target_topk_indices is None:
+            raise ValueError("distill mode requires target_topk_indices buffer")
+        if node_indices is None:
+            raise ValueError("distill mode requires node_indices for target lookup")
+
+        s0 = self.compute_s0(node_text_emb, struct_code_idx, z_q)
+        s = self.token_selector(s0, self.tokenbook_emb)
+        valid = self._valid_mask_for_batch(s0.shape[0], s0.device)
+        mask = build_s0_candidate_mask(s0, self.candidate_pool, valid_mask=valid)
+        s_pool = s.masked_fill(~mask, float("-inf"))
+
+        temp = max(self.student_temperature, 1e-6)
+        p_student = F.softmax(s_pool / temp, dim=-1)
+        topk_batch = self.target_topk_indices[node_indices]
+        p_target = build_mmr_target_distribution(topk_batch, s0.shape[-1])
+        distill_loss = selection_kl_loss(p_student, p_target.detach())
+
+        w = F.gumbel_softmax(s_pool, tau=tau, hard=False, dim=-1)
+        v_text = w @ self.tokenbook_emb
+        logits = self.node_classifier(v_text, z_q, apply_vtext_dropout=True)
+        cls_loss = F.cross_entropy(logits, labels)
+
+        loss = self.distill_weight * distill_loss + self.cls_weight * cls_loss
+        aux: Dict[str, float] = {
+            "distill_loss": float(distill_loss.item()),
+            "cls_loss": float(cls_loss.item()),
+            "total_loss": float(loss.item()),
+        }
         return loss, logits, aux
 
     @torch.no_grad()
@@ -547,6 +730,12 @@ def load_token_selection_trainer(
         entropy_weight=float(config.get("entropy_weight", cfg.token_selector_entropy_weight)),
         vtext_dropout=float(config.get("vtext_dropout", cfg.token_selector_vtext_dropout)),
         selection_valid_mask=selection_valid_mask,
+        training_mode=str(config.get("training_mode", cfg.token_selector_training_mode)),
+        distill_weight=float(config.get("distill_weight", cfg.token_selector_distill_weight)),
+        cls_weight=float(config.get("cls_weight", cfg.token_selector_cls_weight)),
+        student_temperature=float(
+            config.get("student_temperature", cfg.token_selector_student_temperature)
+        ),
     ).to(device)
     trainer.eval()
     return trainer

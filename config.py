@@ -68,6 +68,9 @@ class Config:
     filter_stopwords_at_selection: bool = True  # 选词时屏蔽停用词（词表不变）
     filter_noise_subwords_at_selection: bool = True  # 选词时屏蔽 PDF/子词噪声
     struct_token_prefix: str = "<S_"
+    # 结构 token 展示：id | pcode_supplement | pcode_replace | struct_summary（首行摘要 + 行间 <S_k>）
+    struct_token_mode: str = "id"
+    p_code_struct_top_k: int = 3  # P_code top-k 可读词（pcode_* 模式）
 
     # ---------- 模块3b：可学习 TokenSelector ----------
     token_selector_hidden_dim: int = 128
@@ -81,6 +84,10 @@ class Config:
     token_selector_kl_weight: float = 0.3  # KL(w || softmax(s0))，防止偏离初始得分
     token_selector_entropy_weight: float = 0.01  # 最大化选择熵，缓解模式坍缩
     token_selector_vtext_dropout: float = 0.3  # 训练时对 v_text dropout，迫使分类头依赖文本
+    token_selector_training_mode: str = "distill"  # distill | cls
+    token_selector_distill_weight: float = 1.0  # KL(P_student || P_target_mmr)
+    token_selector_cls_weight: float = 0.05  # 蒸馏模式下弱分类损失
+    token_selector_student_temperature: float = 1.0  # softmax(s_selector) 温度
     token_selector_checkpoint: Optional[Path] = None
 
     # ---------- 模块4：序列化 ----------

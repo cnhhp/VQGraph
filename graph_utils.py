@@ -336,6 +336,47 @@ def load_graph_data(
     return g, feats, labels, idx_train, idx_val, idx_test, text_dict
 
 
+def make_stratified_ratio_split(
+    labels: torch.Tensor,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int = 42,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """按类别分层随机划分 train/val/test（比例之和须为 1）。"""
+    from sklearn.model_selection import train_test_split
+
+    total = float(train_ratio + val_ratio + test_ratio)
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(
+            f"split ratios must sum to 1, got {train_ratio}+{val_ratio}+{test_ratio}={total}"
+        )
+
+    labels_np = labels.detach().cpu().numpy().astype(int)
+    indices = np.arange(labels_np.shape[0])
+    val_test_ratio = val_ratio + test_ratio
+    test_frac = test_ratio / val_test_ratio if val_test_ratio > 0 else 0.5
+
+    idx_train, idx_rest = train_test_split(
+        indices,
+        train_size=train_ratio,
+        stratify=labels_np,
+        random_state=seed,
+    )
+    labels_rest = labels_np[idx_rest]
+    idx_val, idx_test = train_test_split(
+        idx_rest,
+        train_size=1.0 - test_frac,
+        stratify=labels_rest,
+        random_state=seed,
+    )
+    return (
+        torch.tensor(idx_train, dtype=torch.long),
+        torch.tensor(idx_val, dtype=torch.long),
+        torch.tensor(idx_test, dtype=torch.long),
+    )
+
+
 def extract_sentence_bert_embeddings(
     text_dict: Dict[int, str],
     model_name: str = "all-MiniLM-L6-v2",

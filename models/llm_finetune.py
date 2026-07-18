@@ -61,6 +61,16 @@ INSTRUCTION_STRUCT_SUMMARY = (
     "(degree + PageRank + semantic similarity)"
 )
 
+INSTRUCTION_PROJECTED_VECTOR = (
+    "You are given a subgraph of a citation network, centered at a target node.\n"
+    "Format:\n"
+    "- Each line: <level> [v1, v2, ..., v8] [text_tokens]\n"
+    "- [v1..v8] is an 8-d PCA projection of the node's structural codebook vector\n"
+    "- level 0 = target node, level 1 = direct neighbor, level 2 = two-hop neighbor\n"
+    "- Nodes under the same parent are sorted by structural importance "
+    "(degree + PageRank + semantic similarity)"
+)
+
 
 def instruction_for_struct_mode(mode: str) -> str:
     """按 struct_token_mode 返回匹配的 instruction 模板。"""
@@ -70,6 +80,8 @@ def instruction_for_struct_mode(mode: str) -> str:
         return INSTRUCTION_PCODE_STRUCT_REPLACE
     if mode == "struct_summary":
         return INSTRUCTION_STRUCT_SUMMARY
+    if mode == "projected_vector":
+        return INSTRUCTION_PROJECTED_VECTOR
     return DEFAULT_INSTRUCTION
 
 

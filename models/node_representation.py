@@ -177,6 +177,22 @@ class NodeRepresentationTokenizer:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.encoder: Optional[nn.Module] = None
+        self.struct_projector = None
+        if getattr(self.cfg, "struct_token_mode", "id") == "projected_vector":
+            from models.struct_projector import StructuralProjector
+
+            proj_dir = getattr(self.cfg, "projected_codebook_dir", None)
+            if proj_dir is None:
+                raise ValueError(
+                    "struct_token_mode=projected_vector requires projected_codebook_dir"
+                )
+            self.struct_projector = StructuralProjector.load(proj_dir)
+            logger.info(
+                "Loaded StructuralProjector from %s (M=%d, k=%d)",
+                proj_dir,
+                self.struct_projector.projections.shape[0],
+                self.struct_projector.k,
+            )
         self._struct_dist_cache: Optional[torch.Tensor] = None
         self._tfidf_table: Optional[torch.Tensor] = None
 
@@ -663,6 +679,13 @@ class NodeRepresentationTokenizer:
             if pcode_words:
                 return "[struct: " + ", ".join(pcode_words) + "]"
             return id_token
+
+        if mode == "projected_vector":
+            if self.struct_projector is None:
+                raise RuntimeError(
+                    "struct_token_mode=projected_vector but StructuralProjector not loaded"
+                )
+            return self.struct_projector.format_vector(code_idx)
 
         return id_token
 

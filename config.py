@@ -44,6 +44,19 @@ class Config:
     codebook_batch_size: int = -1  # -1 表示全图
     use_contrastive_loss: bool = False
     contrastive_weight: float = 0.1
+    # 层次粗/细码（HANDOFF §17；默认关，保持旧 E1）
+    hierarchical_vq: bool = False
+    codebook_size_coarse: int = 16  # M_co（theme）
+    codebook_size_fine: int = 128  # M_fi（structure；Cora 用 128 对齐固有角色数）
+    lambda_H: float = 1.0  # 同配/异配边重建平衡（+ 轻推异配）
+    lambda_D: float = 0.05  # 双通道解耦
+    lambda_L: float = 0.1  # 弱监督，仅约束连续 h_L（原定 ≤0.1；层次模式无主 CE）
+    lambda_div: float = 0.05  # 粗码使用率 KL
+    lambda_div_fi: float = 0.5  # 细码使用率 KL
+    lambda_ico: float = 0.2  # 同粗码邻居细码拉开
+    select_min_s_L: float = 0.75  # 选模：s_L 达标后再比 unique_fi
+    fine_noise: float = 0.0  # 细码量化前训练噪声（>0 会造成 train/eval 利用率假象）
+    text_fuse: float = 0.5  # text 投影注入粗通道强度
     # Token 预测辅助任务（模块1 训练 + 模块3 推理融合）
     enable_token_predictor: bool = True
     lambda_token: float = 0.05  # α：KL 损失权重
@@ -68,9 +81,11 @@ class Config:
     filter_stopwords_at_selection: bool = True  # 选词时屏蔽停用词（词表不变）
     filter_noise_subwords_at_selection: bool = True  # 选词时屏蔽 PDF/子词噪声
     struct_token_prefix: str = "<S_"
-    # 结构 token 展示：id | pcode_supplement | pcode_replace | struct_summary（首行摘要 + 行间 <S_k>）
+    # 结构 token 展示：id | pcode_supplement | pcode_replace | struct_summary | projected_vector
     struct_token_mode: str = "id"
     p_code_struct_top_k: int = 3  # P_code top-k 可读词（pcode_* 模式）
+    projected_codebook_dir: Optional[Path] = None  # PCA 投影码本目录（projected_vector 模式）
+    struct_vector_decimals: int = 4  # 投影向量小数位数
 
     # ---------- 模块3b：可学习 TokenSelector ----------
     token_selector_hidden_dim: int = 128
@@ -138,6 +153,10 @@ class Config:
         if self.codebook_checkpoint_dir is not None:
             self.codebook_checkpoint_dir = (
                 root / self.codebook_checkpoint_dir
+            ).resolve()
+        if self.projected_codebook_dir is not None:
+            self.projected_codebook_dir = (
+                root / self.projected_codebook_dir
             ).resolve()
         return self
 

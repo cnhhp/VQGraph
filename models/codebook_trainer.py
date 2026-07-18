@@ -38,6 +38,12 @@ class CodebookArtifacts:
     semantic_centers: torch.Tensor
     node_code_assignments: Optional[np.ndarray] = None
     save_dir: Optional[Path] = None
+    # 层次粗/细码（可选）
+    codebook_coarse: Optional[torch.Tensor] = None
+    codebook_fine: Optional[torch.Tensor] = None
+    node_codes_coarse: Optional[np.ndarray] = None
+    node_codes_fine: Optional[np.ndarray] = None
+    hierarchical_vq: bool = False
 
 
 @dataclass
@@ -58,6 +64,27 @@ class TFIDFStatistics:
 
 def _wrap_semantic_vq(model: Model, text_dim: int, cfg: Config) -> SemanticVectorQuantize:
     enc = model.encoder
+    # 层次模式：粗码 SemanticVQ 已在 HierarchicalGCN 内
+    is_hier = getattr(model, "hierarchical_vq", False) or (
+        getattr(enc, "vq_co", None) is not None
+        and enc.__class__.__name__ == "HierarchicalGCN"
+    )
+    if is_hier:
+        svq = enc.vq_co
+        # 若构建时 text_dim 与 Sentence-BERT 不一致，重建 semantic_centers buffer
+        if svq.text_dim != text_dim:
+            logger.warning(
+                "HierarchicalGCN vq_co text_dim=%d != %d; resizing semantic_centers",
+                svq.text_dim,
+                text_dim,
+            )
+            M = svq.codebook_size
+            svq.text_dim = text_dim
+            svq.register_buffer(
+                "semantic_centers",
+                torch.zeros(M, text_dim, device=next(enc.parameters()).device),
+            )
+        return svq
     device = next(enc.parameters()).device
     svq = SemanticVectorQuantize(
         enc.vq,
@@ -82,9 +109,15 @@ def train_semantic_fixed(
 ) -> Tuple[float, Optional[float]]:
     model.train()
     optimizer.zero_grad()
-    _, logits, loss, _, _, token_loss_raw = model(data, feats, text_emb=text_emb)
-    out = logits.log_softmax(dim=1)
-    loss = loss + criterion(out[idx_train], labels[idx_train])
+    if getattr(model, "hierarchical_vq", False):
+        # 层次模式按原定方案：不加主分类 CE（分类留给 LLM）；仅码本自监督 + 可选弱 L_L
+        _, logits, loss, _, _, token_loss_raw = model(
+            data, feats, text_emb=text_emb, labels=labels
+        )
+    else:
+        _, logits, loss, _, _, token_loss_raw = model(data, feats, text_emb=text_emb)
+        out = logits.log_softmax(dim=1)
+        loss = loss + criterion(out[idx_train], labels[idx_train])
     loss_val = loss.item()
     token_loss_val = float(token_loss_raw.item()) if token_loss_raw is not None else None
     (loss * lamb).backward()
@@ -217,15 +250,59 @@ def evaluate_semantic(
 ) -> Tuple[torch.Tensor, float, float, Any, torch.Tensor, torch.Tensor]:
     model.eval()
     with torch.no_grad():
-        infer_out = model.inference(data, feats, text_emb=text_emb)
-        _, logits, _, dist, codebook = infer_out[:5]
-        out = logits.log_softmax(dim=1)
-        if idx_eval is None:
-            loss = criterion(out, labels).item()
-            score = evaluator(out, labels)
+        if getattr(model, "hierarchical_vq", False):
+            # 无主 CE：用弱 L_L 头 val acc 选模（-loss 会偏好细码塌缩）
+            _, logits, loss_t, dist, codebook, _ = model(
+                data, feats, text_emb=text_emb, labels=labels
+            )
+            out = logits.log_softmax(dim=1)
+            loss = float(loss_t.item())
+            assign = getattr(model.encoder, "_last_assign", {}) or {}
+            logits_l = assign.get("logits_l")
+            idx_fi = assign.get("idx_fi")
+            idx_co = assign.get("idx_co")
+            if logits_l is not None:
+                out_l = logits_l.log_softmax(dim=1)
+                if idx_eval is None:
+                    score_l = evaluator(out_l, labels)
+                else:
+                    score_l = evaluator(out_l[idx_eval], labels[idx_eval])
+            else:
+                score_l = 0.0
+            if idx_eval is None:
+                score_probe = evaluator(out, labels)
+            else:
+                score_probe = evaluator(out[idx_eval], labels[idx_eval])
+            uniq_fi = (
+                int(torch.unique(idx_fi).numel()) if idx_fi is not None else 0
+            )
+            uniq_co = (
+                int(torch.unique(idx_co).numel()) if idx_co is not None else 0
+            )
+            model.encoder._last_loss_aux = dict(
+                getattr(model.encoder, "_last_loss_aux", {}) or {}
+            )
+            model.encoder._last_loss_aux["s_L_val"] = float(score_l)
+            model.encoder._last_loss_aux["s_probe"] = float(score_probe)
+            model.encoder._last_loss_aux["unique_fi_eval"] = float(uniq_fi)
+            model.encoder._last_loss_aux["unique_co_eval"] = float(uniq_co)
+            model.encoder._last_loss_aux["codebook_loss"] = loss
+            # 无主 CE：s_L 先达门槛，再最大化 eval 细码占用
+            min_sl = float(getattr(model.encoder, "select_min_s_L", 0.75))
+            if float(score_l) < min_sl:
+                score = float(score_l)
+            else:
+                score = 10.0 + float(uniq_fi) + 0.1 * float(score_l)
         else:
-            loss = criterion(out[idx_eval], labels[idx_eval]).item()
-            score = evaluator(out[idx_eval], labels[idx_eval])
+            infer_out = model.inference(data, feats, text_emb=text_emb)
+            _, logits, _, dist, codebook = infer_out[:5]
+            out = logits.log_softmax(dim=1)
+            if idx_eval is None:
+                loss = criterion(out, labels).item()
+                score = evaluator(out, labels)
+            else:
+                loss = criterion(out[idx_eval], labels[idx_eval]).item()
+                score = evaluator(out[idx_eval], labels[idx_eval])
     return out, loss, score, None, dist, codebook
 
 
@@ -236,11 +313,27 @@ def assign_node_codes(
     text_emb: torch.Tensor,
     device: torch.device,
     batch_size: int = 512,
+    labels: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
-    """全图节点结构码 argmax。"""
+    """全图节点结构码 argmax。层次模式返回细码，并写入 encoder._last_assign。"""
     model.eval()
     n = g.num_nodes()
     codes = np.zeros(n, dtype=np.int64)
+    if getattr(model, "hierarchical_vq", False):
+        if labels is None:
+            raise ValueError("assign_node_codes hierarchical requires labels")
+        with torch.no_grad():
+            infer_out = model.inference(
+                g.to(device),
+                feats.to(device),
+                text_emb=text_emb.to(device),
+                labels=labels.to(device),
+            )
+            dist = infer_out[3]
+        if dist.dim() == 3:
+            dist = dist.squeeze(0)
+        codes = dist.argmax(dim=1).cpu().numpy()
+        return codes
     if "SAGE" in model.model_name:
         g.create_formats_()
         sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
@@ -268,6 +361,31 @@ def assign_node_codes(
             dist = dist.squeeze(0)
         codes = dist.argmax(dim=1).cpu().numpy()
     return codes
+
+
+def assign_hierarchical_codes(
+    model: Model,
+    g: Any,
+    feats: torch.Tensor,
+    text_emb: torch.Tensor,
+    labels: torch.Tensor,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """返回 (codes_coarse, codes_fine)。"""
+    model.eval()
+    with torch.no_grad():
+        model.inference(
+            g.to(device),
+            feats.to(device),
+            text_emb=text_emb.to(device),
+            labels=labels.to(device),
+        )
+    last = getattr(model.encoder, "_last_assign", {})
+    idx_co = last.get("idx_co")
+    idx_fi = last.get("idx_fi")
+    if idx_co is None or idx_fi is None:
+        raise RuntimeError("Hierarchical assign missing _last_assign indices")
+    return idx_co.cpu().numpy(), idx_fi.cpu().numpy()
 
 
 class CodebookTrainer:
@@ -315,6 +433,68 @@ class CodebookTrainer:
         labels = labels.to(device)
         text_embeddings = text_embeddings.to(device)
         self.text_embeddings = text_embeddings
+
+        # 层次模式：写入 conf，供 Model / HierarchicalGCN 使用
+        hierarchical = bool(
+            conf.get("hierarchical_vq", getattr(self.cfg, "hierarchical_vq", False))
+        )
+        conf["hierarchical_vq"] = hierarchical
+        conf["text_dim"] = int(text_embeddings.shape[1])
+        conf["lambda_semantic"] = self.cfg.lambda_semantic
+        conf["ema_beta"] = self.cfg.ema_beta
+        if hierarchical:
+            conf["codebook_size_coarse"] = int(
+                conf.get(
+                    "codebook_size_coarse",
+                    getattr(self.cfg, "codebook_size_coarse", 16),
+                )
+            )
+            conf["codebook_size_fine"] = int(
+                conf.get(
+                    "codebook_size_fine",
+                    getattr(self.cfg, "codebook_size_fine", 256),
+                )
+            )
+            conf["codebook_size"] = conf["codebook_size_fine"]
+            conf.setdefault("lambda_H", getattr(self.cfg, "lambda_H", 0.5))
+            conf.setdefault("lambda_D", getattr(self.cfg, "lambda_D", 0.05))
+            conf.setdefault("lambda_L", getattr(self.cfg, "lambda_L", 0.1))
+            conf.setdefault("lambda_div", getattr(self.cfg, "lambda_div", 0.05))
+            conf.setdefault("lambda_div_fi", getattr(self.cfg, "lambda_div_fi", 0.5))
+            conf.setdefault("lambda_ico", getattr(self.cfg, "lambda_ico", 0.2))
+            conf.setdefault(
+                "select_min_s_L", getattr(self.cfg, "select_min_s_L", 0.75)
+            )
+            conf.setdefault("fine_noise", getattr(self.cfg, "fine_noise", 0.0))
+            conf.setdefault("text_fuse", getattr(self.cfg, "text_fuse", 0.5))
+            self.cfg.hierarchical_vq = True
+            self.cfg.codebook_size_coarse = conf["codebook_size_coarse"]
+            self.cfg.codebook_size_fine = conf["codebook_size_fine"]
+            self.cfg.codebook_size = conf["codebook_size_fine"]
+            self.cfg.lambda_H = float(conf["lambda_H"])
+            self.cfg.lambda_D = float(conf["lambda_D"])
+            self.cfg.lambda_L = float(conf["lambda_L"])
+            self.cfg.lambda_div = float(conf["lambda_div"])
+            self.cfg.lambda_div_fi = float(conf["lambda_div_fi"])
+            self.cfg.lambda_ico = float(conf["lambda_ico"])
+            self.cfg.select_min_s_L = float(conf["select_min_s_L"])
+            self.cfg.fine_noise = float(conf["fine_noise"])
+            self.cfg.text_fuse = float(conf["text_fuse"])
+            log.info(
+                "Hierarchical VQ: M_co=%d M_fi=%d lambda_H=%.3f lambda_D=%.3f "
+                "lambda_L=%.3f lambda_div=%.3f lambda_div_fi=%.3f lambda_ico=%.3f "
+                "text_fuse=%.3f select_min_s_L=%.2f (no main CE)",
+                conf["codebook_size_coarse"],
+                conf["codebook_size_fine"],
+                conf["lambda_H"],
+                conf["lambda_D"],
+                conf["lambda_L"],
+                conf["lambda_div"],
+                conf["lambda_div_fi"],
+                conf["lambda_ico"],
+                conf["text_fuse"],
+                conf["select_min_s_L"],
+            )
 
         model = self.build_model(conf)
         self.wrap_semantic_vq(text_embeddings.shape[1])
@@ -454,6 +634,14 @@ class CodebookTrainer:
             lam_eff = 0.0 if in_warmup else self.cfg.lambda_semantic
             assert self.svq is not None
             self.svq.set_lambda_effective(lam_eff)
+            # L_H warmup：与语义 λ 同步线性升到目标
+            if hierarchical and hasattr(model.encoder, "set_lambda_H_effective"):
+                target_h = float(conf.get("lambda_H", self.cfg.lambda_H))
+                if in_warmup and warmup_epochs > 0:
+                    h_eff = target_h * (epoch / float(warmup_epochs))
+                else:
+                    h_eff = target_h
+                model.encoder.set_lambda_H_effective(h_eff)
 
             if "SAGE" in model.model_name:
                 loss, token_loss = train_sage_semantic(
@@ -476,6 +664,7 @@ class CodebookTrainer:
                     optimizer,
                     idx_train,
                 )
+            train_aux = dict(getattr(model.encoder, "_last_loss_aux", {}) or {})
 
             if epoch % eval_interval == 0:
                 out, loss_val_f, score_val, _, dist, codebook = evaluate_semantic(
@@ -489,28 +678,51 @@ class CodebookTrainer:
                     idx_val,
                 )
                 score_test = evaluator(out[idx_test], labels[idx_test])
+                aux = train_aux
+                aux_str = ""
+                eval_aux = dict(getattr(model.encoder, "_last_loss_aux", {}) or {})
+                if hierarchical and aux:
+                    aux_str = (
+                        " | L_co=%.4f L_fi=%.4f edge=%.4f L_H=%.4f L_ico=%.4f "
+                        "uniq_co=%d/%d uniq_fi=%d/%d | s_L=%.4f probe=%.4f"
+                        % (
+                            aux.get("commit_co", 0.0),
+                            aux.get("commit_fi", 0.0),
+                            aux.get("edge_rec", 0.0),
+                            aux.get("L_H", 0.0),
+                            aux.get("L_ico", 0.0),
+                            int(aux.get("unique_co", 0)),
+                            int(eval_aux.get("unique_co_eval", 0)),
+                            int(aux.get("unique_fi", 0)),
+                            int(eval_aux.get("unique_fi_eval", 0)),
+                            float(eval_aux.get("s_L_val", 0.0)),
+                            float(eval_aux.get("s_probe", 0.0)),
+                        )
+                    )
                 if token_loss is not None:
                     log.info(
                         "Ep %3d | warmup=%s | lambda_eff=%.4f | loss=%.4f | "
-                        "L_token=%.4f | s_val=%.4f | s_test=%.4f",
+                        "L_token=%.4f | s_val=%.4f | s_test=%.4f%s",
                         epoch,
                         in_warmup,
                         lam_eff,
                         loss,
                         token_loss,
-                        score_val,
-                        score_test,
+                        score_val if not hierarchical else float(eval_aux.get("s_L_val", 0.0)),
+                        score_test if not hierarchical else float(eval_aux.get("s_probe", 0.0)),
+                        aux_str,
                     )
                 else:
                     log.info(
                         "Ep %3d | warmup=%s | lambda_eff=%.4f | loss=%.4f | "
-                        "s_val=%.4f | s_test=%.4f",
+                        "s_val=%.4f | s_test=%.4f%s",
                         epoch,
                         in_warmup,
                         lam_eff,
                         loss,
-                        score_val,
-                        score_test,
+                        score_val if not hierarchical else float(eval_aux.get("s_L_val", 0.0)),
+                        score_test if not hierarchical else float(eval_aux.get("s_probe", 0.0)),
+                        aux_str,
                     )
                 latest_state = copy.deepcopy(model.state_dict())
                 if epoch >= stable_min_epoch:
@@ -535,12 +747,21 @@ class CodebookTrainer:
 
         if best_epoch >= stable_min_epoch:
             model.load_state_dict(state)
-            log.info(
-                "Best epoch %d (>= stable min %d), val acc %.4f",
-                best_epoch,
-                stable_min_epoch,
-                best_score_val,
-            )
+            if hierarchical:
+                log.info(
+                    "Best epoch %d (>= stable min %d), select_score=%.4f "
+                    "(no main CE; gate s_L then uniq_fi)",
+                    best_epoch,
+                    stable_min_epoch,
+                    best_score_val,
+                )
+            else:
+                log.info(
+                    "Best epoch %d (>= stable min %d), val acc %.4f",
+                    best_epoch,
+                    stable_min_epoch,
+                    best_score_val,
+                )
         else:
             model.load_state_dict(latest_state)
             best_epoch = last_epoch
@@ -552,17 +773,47 @@ class CodebookTrainer:
             )
             state = copy.deepcopy(latest_state)
 
-        node_codes = assign_node_codes(
-            model, g, feats, text_embeddings, device, conf.get("batch_size", 512)
-        )
-        assert self.svq is not None
-        artifacts = CodebookArtifacts(
-            encoder_state_dict=state,
-            codebook_embeddings=self.svq.codebook.detach().cpu(),
-            semantic_centers=self.svq.semantic_centers.detach().cpu(),
-            node_code_assignments=node_codes,
-            save_dir=output_dir,
-        )
+        if hierarchical:
+            codes_co, codes_fi = assign_hierarchical_codes(
+                model, g, feats, text_embeddings, labels, device
+            )
+            node_codes = codes_fi
+            assert self.svq is not None
+            cb_co = model.encoder.vq_co.codebook.detach().cpu()
+            cb_fi = model.encoder.vq_fi.codebook.detach().cpu()
+            artifacts = CodebookArtifacts(
+                encoder_state_dict=state,
+                codebook_embeddings=cb_fi,
+                semantic_centers=self.svq.semantic_centers.detach().cpu(),
+                node_code_assignments=node_codes,
+                save_dir=output_dir,
+                codebook_coarse=cb_co,
+                codebook_fine=cb_fi,
+                node_codes_coarse=codes_co,
+                node_codes_fine=codes_fi,
+                hierarchical_vq=True,
+            )
+            n_co = len(np.unique(codes_co))
+            n_fi = len(np.unique(codes_fi))
+            log.info(
+                "Hierarchical assign: unique coarse=%d/%d fine=%d/%d",
+                n_co,
+                conf["codebook_size_coarse"],
+                n_fi,
+                conf["codebook_size_fine"],
+            )
+        else:
+            node_codes = assign_node_codes(
+                model, g, feats, text_embeddings, device, conf.get("batch_size", 512)
+            )
+            assert self.svq is not None
+            artifacts = CodebookArtifacts(
+                encoder_state_dict=state,
+                codebook_embeddings=self.svq.codebook.detach().cpu(),
+                semantic_centers=self.svq.semantic_centers.detach().cpu(),
+                node_code_assignments=node_codes,
+                save_dir=output_dir,
+            )
         self.save_artifacts(artifacts, output_dir, train_conf=conf)
         return artifacts
 
@@ -690,6 +941,27 @@ class CodebookTrainer:
                 save_dir / "node_codes.npz",
                 node_codes=artifacts.node_code_assignments,
             )
+        if artifacts.hierarchical_vq:
+            if artifacts.codebook_coarse is not None:
+                np.savez(
+                    save_dir / "codebook_coarse.npz",
+                    artifacts.codebook_coarse.numpy(),
+                )
+            if artifacts.codebook_fine is not None:
+                np.savez(
+                    save_dir / "codebook_fine.npz",
+                    artifacts.codebook_fine.numpy(),
+                )
+            if artifacts.node_codes_coarse is not None:
+                np.savez(
+                    save_dir / "node_codes_coarse.npz",
+                    node_codes=artifacts.node_codes_coarse,
+                )
+            if artifacts.node_codes_fine is not None:
+                np.savez(
+                    save_dir / "node_codes_fine.npz",
+                    node_codes=artifacts.node_codes_fine,
+                )
         cfg_snap = {
             "lambda_semantic": self.cfg.lambda_semantic,
             "warmup_epochs": self.cfg.warmup_epochs,
@@ -705,7 +977,20 @@ class CodebookTrainer:
             "p_code_normalize": getattr(self.cfg, "p_code_normalize", "none"),
             "lambda_pred": self.cfg.lambda_pred,
             "text_vocab_size": self.cfg.text_vocab_size,
+            "hierarchical_vq": bool(artifacts.hierarchical_vq),
+            "codebook_size_coarse": getattr(self.cfg, "codebook_size_coarse", 16),
+            "codebook_size_fine": getattr(self.cfg, "codebook_size_fine", 256),
+            "lambda_H": getattr(self.cfg, "lambda_H", 0.5),
+            "lambda_D": getattr(self.cfg, "lambda_D", 0.05),
+            "lambda_L": getattr(self.cfg, "lambda_L", 0.05),
         }
+        if artifacts.hierarchical_vq and artifacts.codebook_fine is not None:
+            cfg_snap["codebook_size"] = int(artifacts.codebook_fine.shape[0])
+            if artifacts.codebook_coarse is not None:
+                cfg_snap["codebook_size_coarse"] = int(
+                    artifacts.codebook_coarse.shape[0]
+                )
+            cfg_snap["codebook_size_fine"] = int(artifacts.codebook_fine.shape[0])
         with open(save_dir / "config.json", "w", encoding="utf-8") as f:
             json.dump(cfg_snap, f, indent=2)
         if train_conf is not None:
@@ -757,6 +1042,39 @@ class CodebookTrainer:
         conf["codebook_size"] = getattr(args, "codebook_size", None) or conf.get(
             "codebook_size", 2048
         )
+        hierarchical = bool(getattr(args, "hierarchical_vq", False))
+        conf["hierarchical_vq"] = hierarchical
+        if hierarchical:
+            conf["codebook_size_coarse"] = int(
+                getattr(args, "codebook_size_coarse", None)
+                or conf.get("codebook_size_coarse", 16)
+            )
+            conf["codebook_size_fine"] = int(
+                getattr(args, "codebook_size_fine", None)
+                or conf.get("codebook_size_fine", 128)
+            )
+            conf["codebook_size"] = conf["codebook_size_fine"]
+            if getattr(args, "lambda_H", None) is not None:
+                conf["lambda_H"] = float(args.lambda_H)
+            if getattr(args, "lambda_D", None) is not None:
+                conf["lambda_D"] = float(args.lambda_D)
+            if getattr(args, "lambda_L", None) is not None:
+                conf["lambda_L"] = float(args.lambda_L)
+            if getattr(args, "lambda_div", None) is not None:
+                conf["lambda_div"] = float(args.lambda_div)
+            if getattr(args, "lambda_div_fi", None) is not None:
+                conf["lambda_div_fi"] = float(args.lambda_div_fi)
+            if getattr(args, "lambda_ico", None) is not None:
+                conf["lambda_ico"] = float(args.lambda_ico)
+            if getattr(args, "select_min_s_L", None) is not None:
+                conf["select_min_s_L"] = float(args.select_min_s_L)
+            if getattr(args, "text_fuse", None) is not None:
+                conf["text_fuse"] = float(args.text_fuse)
+            # 层次模式默认加强边监督
+            if getattr(args, "lamb_edge", None) is not None:
+                conf["lamb_edge"] = float(args.lamb_edge)
+            else:
+                conf.setdefault("lamb_edge", 0.15)
         defaults = {
             "norm_type": "none",
             "dropout_ratio": 0.0,
@@ -771,6 +1089,15 @@ class CodebookTrainer:
             "lamb_node": 0.001,
             "lamb_edge": 0.03,
             "patience": 50,
+            "lambda_H": 1.0,
+            "lambda_D": 0.05,
+            "lambda_L": 0.1,
+            "lambda_div": 0.05,
+            "lambda_div_fi": 0.5,
+            "lambda_ico": 0.2,
+            "select_min_s_L": 0.75,
+            "fine_noise": 0.0,
+            "text_fuse": 0.5,
         }
         for k, v in defaults.items():
             conf.setdefault(k, v)

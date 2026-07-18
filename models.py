@@ -248,7 +248,48 @@ class Model(nn.Module):
     def __init__(self, conf):
         super(Model, self).__init__()
         self.model_name = conf["model_name"]
-        if "SAGE" in conf["model_name"]:
+        self.hierarchical_vq = bool(conf.get("hierarchical_vq", False))
+        if self.hierarchical_vq:
+            if "SAGE" in conf["model_name"]:
+                raise ValueError(
+                    "hierarchical_vq currently supports GCN only; use --teacher GCN"
+                )
+            if "GCN" not in conf["model_name"]:
+                raise ValueError(
+                    f"hierarchical_vq requires GCN, got {conf['model_name']}"
+                )
+            from models.hierarchical_encoder import HierarchicalGCN
+
+            self.encoder = HierarchicalGCN(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+                codebook_size_coarse=conf.get(
+                    "codebook_size_coarse", conf.get("codebook_size", 16)
+                ),
+                codebook_size_fine=conf.get(
+                    "codebook_size_fine", conf.get("codebook_size", 256)
+                ),
+                lamb_edge=conf["lamb_edge"],
+                lamb_node=conf["lamb_node"],
+                lambda_H=conf.get("lambda_H", 0.5),
+                lambda_D=conf.get("lambda_D", 0.05),
+                lambda_L=conf.get("lambda_L", 0.2),
+                lambda_div=conf.get("lambda_div", 0.05),
+                lambda_div_fi=conf.get("lambda_div_fi", 0.5),
+                lambda_ico=conf.get("lambda_ico", 0.2),
+                lambda_semantic=conf.get("lambda_semantic", 0.3),
+                text_dim=conf.get("text_dim", 384),
+                ema_beta=conf.get("ema_beta", 0.99),
+                text_fuse=conf.get("text_fuse", 0.5),
+                fine_noise=conf.get("fine_noise", 0.0),
+                select_min_s_L=conf.get("select_min_s_L", 0.75),
+            ).to(conf["device"])
+        elif "SAGE" in conf["model_name"]:
             self.encoder = SAGE(
                 num_layers=conf["num_layers"],
                 input_dim=conf["feat_dim"],
@@ -287,13 +328,27 @@ class Model(nn.Module):
     ) -> None:
         self.encoder.attach_token_predictor(vocab_size, tokenbook_embeddings, cfg)
 
-    def forward(self, data, feats, text_emb: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        data,
+        feats,
+        text_emb: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ):
+        if self.hierarchical_vq:
+            return self.encoder(data, feats, text_emb=text_emb, labels=labels)
         return self.encoder(data, feats, text_emb=text_emb)
 
-    def inference(self, data, feats, text_emb: Optional[torch.Tensor] = None):
-        if "SAGE" in self.model_name:
+    def inference(
+        self,
+        data,
+        feats,
+        text_emb: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ):
+        if "SAGE" in self.model_name and not self.hierarchical_vq:
             return self.encoder.inference(data, feats, text_emb=text_emb)
-        out = self.forward(data, feats, text_emb=text_emb)
+        out = self.forward(data, feats, text_emb=text_emb, labels=labels)
         if len(out) == 5:
             return out + (None,)
         return out

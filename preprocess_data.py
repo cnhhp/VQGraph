@@ -92,6 +92,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="可选：训练好的 TokenSelector checkpoint（best.pth）",
     )
+    p.add_argument(
+        "--struct_token_mode",
+        type=str,
+        default=None,
+        choices=["id", "pcode_supplement", "pcode_replace", "struct_summary", "projected_vector"],
+        help="结构 token 展示模式；projected_vector 需 --projected_codebook_dir",
+    )
+    p.add_argument(
+        "--projected_codebook_dir",
+        type=str,
+        default=None,
+        help="PCA 投影码本目录（struct_token_mode=projected_vector 时必需）",
+    )
     return p.parse_args()
 
 
@@ -104,7 +117,7 @@ def build_pipeline(
     text_dict: Dict[int, str],
 ) -> PreprocessPipeline:
     from models.codebook_trainer import CodebookTrainer, TFIDFComputer
-    from models.llm_finetune import DEFAULT_INSTRUCTION
+    from models.llm_finetune import instruction_for_struct_mode
     from models.node_representation import NodeRepresentationTokenizer
     from models.serialization import BiasedEulerSerializer
     from models.subgraph_extraction import SubgraphExtractor
@@ -149,6 +162,15 @@ def build_pipeline(
         cfg.p_code_normalize = args.p_code_normalize
     if args.token_selector_checkpoint:
         cfg.token_selector_checkpoint = Path(args.token_selector_checkpoint)
+    if args.struct_token_mode is not None:
+        cfg.struct_token_mode = args.struct_token_mode
+    if args.projected_codebook_dir is not None:
+        cfg.projected_codebook_dir = Path(args.projected_codebook_dir)
+    elif cfg.struct_token_mode == "projected_vector":
+        default_proj = codebook_dir / "projected_k8"
+        if default_proj.exists():
+            cfg.projected_codebook_dir = default_proj
+            logger.info("Using default projected_codebook_dir: %s", default_proj)
 
     extractor = SubgraphExtractor(cfg)
     token_selector = None
@@ -176,7 +198,7 @@ def build_pipeline(
         tokenizer=tokenizer,
         serializer=serializer,
         dataset_name=cfg.dataset_name,
-        instruction=DEFAULT_INSTRUCTION,
+        instruction=instruction_for_struct_mode(cfg.struct_token_mode),
     )
 
 
@@ -277,6 +299,10 @@ def main() -> None:
         cfg.lambda_pred = args.lambda_pred
     if args.p_code_normalize is not None:
         cfg.p_code_normalize = args.p_code_normalize
+    if args.struct_token_mode is not None:
+        cfg.struct_token_mode = args.struct_token_mode
+    if args.projected_codebook_dir is not None:
+        cfg.projected_codebook_dir = Path(args.projected_codebook_dir)
 
     set_seed(args.seed)
     out_dir = Path(args.output_dir)
@@ -319,6 +345,12 @@ def main() -> None:
             "lambda_pred": cfg.lambda_pred,
             "p_code_normalize": cfg.p_code_normalize,
             "lambda_tfidf": cfg.lambda_tfidf,
+            "struct_token_mode": cfg.struct_token_mode,
+            "projected_codebook_dir": (
+                str(cfg.projected_codebook_dir)
+                if getattr(cfg, "projected_codebook_dir", None)
+                else None
+            ),
             "token_selector_checkpoint": (
                 str(cfg.token_selector_checkpoint)
                 if getattr(cfg, "token_selector_checkpoint", None)

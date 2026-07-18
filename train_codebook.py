@@ -41,6 +41,67 @@ def parse_args() -> argparse.Namespace:
         help="仅 epoch >= 此值时更新 best checkpoint 并统计 TF-IDF（默认 warmup_epochs+1）",
     )
     p.add_argument("--codebook_size", type=int, default=None)
+    p.add_argument(
+        "--hierarchical_vq",
+        action="store_true",
+        help="启用层次粗/细码（双通道 GCN + SemanticVQ 粗码 + 残差细码 + L_H/L_D）",
+    )
+    p.add_argument(
+        "--codebook_size_coarse",
+        type=int,
+        default=None,
+        help="粗码本大小 M_co（默认 16）",
+    )
+    p.add_argument(
+        "--codebook_size_fine",
+        type=int,
+        default=None,
+        help="细码本大小 M_fi（默认 256）",
+    )
+    p.add_argument("--lambda_H", type=float, default=None, help="异配边重建平衡权重")
+    p.add_argument("--lambda_D", type=float, default=None, help="双通道解耦权重")
+    p.add_argument(
+        "--lambda_L",
+        type=float,
+        default=None,
+        help="弱监督 L_L 权重（仅约束连续 h_L）",
+    )
+    p.add_argument(
+        "--lambda_div",
+        type=float,
+        default=None,
+        help="粗码使用率 KL 权重",
+    )
+    p.add_argument(
+        "--lambda_div_fi",
+        type=float,
+        default=None,
+        help="细码使用率 KL 权重（soft+hard）",
+    )
+    p.add_argument(
+        "--lambda_ico",
+        type=float,
+        default=None,
+        help="同粗码邻居细码拉开 L_intra_co 权重",
+    )
+    p.add_argument(
+        "--select_min_s_L",
+        type=float,
+        default=None,
+        help="层次选模：弱 L_L val 门槛，达标后再比 unique_fi",
+    )
+    p.add_argument(
+        "--fine_noise",
+        type=float,
+        default=None,
+        help="细码量化前训练噪声标准差",
+    )
+    p.add_argument(
+        "--text_fuse",
+        type=float,
+        default=None,
+        help="text 投影注入粗通道强度",
+    )
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--device", type=int, default=0, help="-1 for CPU")
@@ -164,6 +225,30 @@ def main() -> None:
         cfg.tfidf_stats_min_epoch = args.tfidf_stats_min_epoch
     if args.codebook_size is not None:
         cfg.codebook_size = args.codebook_size
+    if args.hierarchical_vq:
+        cfg.hierarchical_vq = True
+    if args.codebook_size_coarse is not None:
+        cfg.codebook_size_coarse = args.codebook_size_coarse
+    if args.codebook_size_fine is not None:
+        cfg.codebook_size_fine = args.codebook_size_fine
+    if args.lambda_H is not None:
+        cfg.lambda_H = args.lambda_H
+    if args.lambda_D is not None:
+        cfg.lambda_D = args.lambda_D
+    if args.lambda_L is not None:
+        cfg.lambda_L = args.lambda_L
+    if getattr(args, "lambda_div", None) is not None:
+        cfg.lambda_div = args.lambda_div
+    if getattr(args, "lambda_div_fi", None) is not None:
+        cfg.lambda_div_fi = args.lambda_div_fi
+    if getattr(args, "lambda_ico", None) is not None:
+        cfg.lambda_ico = args.lambda_ico
+    if getattr(args, "select_min_s_L", None) is not None:
+        cfg.select_min_s_L = args.select_min_s_L
+    if getattr(args, "fine_noise", None) is not None:
+        cfg.fine_noise = args.fine_noise
+    if getattr(args, "text_fuse", None) is not None:
+        cfg.text_fuse = args.text_fuse
     if args.epochs is not None:
         cfg.codebook_train_epochs = args.epochs
     if args.sentence_bert:
@@ -261,6 +346,64 @@ def main() -> None:
         conf["seed"] = args.seed
         conf["dataset"] = args.dataset
         conf["tokenbook_dir"] = args.tokenbook_dir
+        conf["hierarchical_vq"] = bool(args.hierarchical_vq or cfg.hierarchical_vq)
+        if conf["hierarchical_vq"]:
+            conf["codebook_size_coarse"] = (
+                args.codebook_size_coarse
+                if args.codebook_size_coarse is not None
+                else cfg.codebook_size_coarse
+            )
+            conf["codebook_size_fine"] = (
+                args.codebook_size_fine
+                if args.codebook_size_fine is not None
+                else cfg.codebook_size_fine
+            )
+            conf["lambda_H"] = (
+                args.lambda_H if args.lambda_H is not None else cfg.lambda_H
+            )
+            conf["lambda_D"] = (
+                args.lambda_D if args.lambda_D is not None else cfg.lambda_D
+            )
+            conf["lambda_L"] = (
+                args.lambda_L if args.lambda_L is not None else cfg.lambda_L
+            )
+            conf["lambda_div"] = (
+                args.lambda_div
+                if getattr(args, "lambda_div", None) is not None
+                else getattr(cfg, "lambda_div", 0.05)
+            )
+            conf["lambda_div_fi"] = (
+                args.lambda_div_fi
+                if getattr(args, "lambda_div_fi", None) is not None
+                else getattr(cfg, "lambda_div_fi", 0.5)
+            )
+            conf["lambda_ico"] = (
+                args.lambda_ico
+                if getattr(args, "lambda_ico", None) is not None
+                else getattr(cfg, "lambda_ico", 0.2)
+            )
+            conf["select_min_s_L"] = (
+                args.select_min_s_L
+                if getattr(args, "select_min_s_L", None) is not None
+                else getattr(cfg, "select_min_s_L", 0.75)
+            )
+            conf["fine_noise"] = (
+                args.fine_noise
+                if getattr(args, "fine_noise", None) is not None
+                else getattr(cfg, "fine_noise", 0.0)
+            )
+            conf["text_fuse"] = (
+                args.text_fuse
+                if getattr(args, "text_fuse", None) is not None
+                else getattr(cfg, "text_fuse", 0.5)
+            )
+            # v2：层次模式默认略强语义偏置
+            if args.lambda_semantic is None and conf.get("lambda_semantic") is None:
+                conf["lambda_semantic"] = max(
+                    getattr(cfg, "lambda_semantic", 0.1), 0.3
+                )
+            if args.teacher != "GCN":
+                raise ValueError("hierarchical_vq currently requires --teacher GCN")
         if cfg.tfidf_stats_min_epoch is not None:
             conf["tfidf_stats_min_epoch"] = cfg.tfidf_stats_min_epoch
         if args.load_checkpoint:

@@ -1,8 +1,9 @@
 # VQGraph 项目交接文档
 
-> 更新日期：2026-06-05（本对话交接）  
+> 更新日期：2026-07-18  
 > 仓库：https://github.com/cnhhp/VQGraph  
-> 规格说明：[`prompt.md`](prompt.md)
+> 规格说明：[`prompt.md`](prompt.md)  
+> 新增：§17 层次粗/细码 + HeteroGen（**训练逻辑已实现**；LLM JSON 未做）
 
 ---
 
@@ -92,6 +93,7 @@ Host vqgraph-gpu
 | **struct_token 多模式** | ⚠️ | `id` / `pcode_*` / `struct_summary` 代码已有；**preprocess 未完全接入** |
 | **strip struct** | ✅ | `scripts/strip_struct_tokens_jsonl.py` |
 | **60/20/20 split** | ✅ | `graph_utils.make_stratified_ratio_split()` |
+| **层次粗/细码 + HeteroGen** | ✅ 训练侧 | `--hierarchical_vq`：双通道 GCN + 粗/细 VQ + L_H/L_D；见 **§17**；**LLM JSON 未做** |
 
 ---
 
@@ -529,9 +531,10 @@ PY
 
 1. **汇总 QLoRA：** PubMed（ep3/seq1536/lr5e-5）及 Cora e5b vs nocode vs no_stoken val/test acc  
 2. **序列化改进（优先）：** `struct_summary` 首行 + 行内去掉重复 `<S_k>`，重新生成 JSONL 并 QLoRA 对比  
-3. **（可选）** preprocess 加 `--struct_token_mode` CLI；训练时记录 train/val acc  
-4. **（可选）** PubMed 超参：若仍 ~60%，试 ep2 + lr1e-4 + 检查截断  
-5. **（长期）** ogbn-arxiv 数据管线；LLM-aware codebook 重训  
+3. **层次粗/细码（§17）：** ✅ 训练侧已实现；下一步 P2 新 JSONL + QLoRA；可选 P3（L_M / 双 decoder / SAGE）  
+4. **（可选）** preprocess 加 `--struct_token_mode` CLI；训练时记录 train/val acc  
+5. **（可选）** PubMed 超参：若仍 ~60%，试 ep2 + lr1e-4 + 检查截断  
+6. **（长期）** ogbn-arxiv 数据管线；LLM-aware codebook 重训  
 
 ---
 
@@ -542,7 +545,7 @@ PY
 GitHub: https://github.com/cnhhp/VQGraph
 服务器：ssh vqgraph-gpu → ~/huanghp_2252895/VQGraph，conda 2252895_vqgraph
 
-请先读 HANDOFF.md（§5.1 Codebook→LLM 诊断）与 config.py。
+请先读 HANDOFF.md（§5.1 Codebook→LLM 诊断；§17 层次粗/细码设计）与 config.py。
 
 已完成：
 - E5b 配方：factorized + 码本级 KL + p_code_normalize=max + λ_pred=0.05
@@ -550,6 +553,7 @@ GitHub: https://github.com/cnhhp/VQGraph
 - strip 版：*_no_stoken；struct_summary 实验 JSONL（preprocess 未完全接入）
 - TokenSelector + MMR 蒸馏训练链路
 - 核心结论：结构 codebook 信息几乎未进入 LLM 决策；<S_k> 重复浪费 context
+- §17 层次粗/细码 + HeteroGen：**训练逻辑已实现**（`--hierarchical_vq`）；LLM JSON 未做
 
 码本：
 - Cora: outputs/experiments/e5b_no_ltoken/cora/GCN/seed_1/
@@ -569,3 +573,227 @@ JSONL/outputs 未 commit，需 scp 到服务器。
 | seed0 | `e1_tau003` | `e5b_code_level` | `llm_finetune_e5b` | `llm_finetune_v2` |
 | seed1 | `e1_tau003_s1` | `e5b_code_level_s1` | `llm_finetune_e5b_s1` | `llm_finetune_nocode_s1` |
 | **no_ltoken** | `e1_no_ltoken` | `e5b_no_ltoken` | `llm_finetune_e5b_no_ltoken` | `llm_finetune_nocode_no_ltoken` |
+
+---
+
+## 17. 设计草案：层次粗/细码 + HeteroGen 异配感知
+
+> **状态：码本训练逻辑已实现**（`--hierarchical_vq`，仅 GCN）；**LLM JSON / preprocess 未做**。  
+> 参考：*Graph Generation Beyond Homophily Assumptions*（HeteroGen）  
+> 目标：缓解「邻域同码 + 异配/边缘节点误伤」；粗码=theme、细码=structure；分类主战场仍在 LLM。
+
+### 17.0 训练 CLI（已实现）
+
+```bash
+python train_codebook.py --dataset cora --data_source text --teacher GCN \
+  --hierarchical_vq \
+  --codebook_size_coarse 16 --codebook_size_fine 128 \
+  --lambda_H 1.0 --lambda_D 0.05 --lambda_L 0.1 \
+  --lambda_div 0.05 --lambda_div_fi 0.5 --lambda_ico 0.2 \
+  --select_min_s_L 0.75 --fine_noise 0.0 --lamb_edge 0.15 \
+  --text_fuse 0.5 --lambda_semantic 0.3 --learning_rate 1e-3 \
+  --no_token_predictor --epochs 120 --device 0 \
+  --output_dir ./outputs/experiments/hier_vq_cora_v5
+```
+
+**v2（有主 CE）：** best GNN val **75.2%**；coarse **13/16**、fine **34/256**；细码–标签 NMI≈0.43；异配同细码 **30.5%**。  
+**v3（有主 CE + 强 div）：** fine **47/256**；GNN val **71.8%**；异配同细码 **21.5%**。  
+
+**v4 按原定去掉主 CE（2026-07-18）：** trainer 层次模式不再加 `criterion(logits,y)`；保留弱 \(L_L\)（\(\lambda_L=0.1\)，只约束 \(h_L\)）；边重建改回**只绑 \(z_{\mathrm{fi}}\)**；结构通道关闭 dropout / `fine_noise=0`；选模曾偏 unique。  
+**Cora v4：** coarse **13/16**、fine **35/256**（\(N_{\mathrm{eff}}\approx10.5\)）；细码–标签 NMI **0.19**；同配/异配同细码 **33.8%/32.8%**（结构偏弱）。产物：`hier_vq_cora_v4/`。
+
+**v5 修 v4 结构弱/选模偏（2026-07-18）：**  
+- 边损失：cosine + 正负采样（去掉 min-max MSE）；\(L_H\) 含轻推异配；`lamb_edge=0.15`、`lambda_H=1.0`  
+- \(L_{\mathrm{intra\_co}}\)（`lambda_ico=0.2`）：同粗码邻居拉开细码  
+- 选模：`s_L≥0.75` 后再最大化 `uniq_fi`  
+- \(M_{\mathrm{fi}}=128\)  
+**Cora v5（seed_1, best ep119）vs v4：**  
+
+| | v4 | **v5** |
+|--|----|--------|
+| fine unique | 35/256 (14%) | **90/128 (70%)** |
+| fine \(N_{\mathrm{eff}}\) | 10.5 | **46.2** |
+| fine–label NMI | 0.19 | 0.31（仍远低于有主 CE 的 ~0.45） |
+| 同配/异配同细码 | 33.8%/32.8% (gap≈0) | **31.2%/22.2% (gap=0.09)** |
+| coarse Neff / NMI | 4.6 / 0.39 | **11.7 / 0.61** |
+| s_L（弱 \(L_L\)） | ~66%（早停） | **~86%** |
+| 类内 fine Neff 均值 | 7.3 | **18.0** |
+
+产物：`outputs/experiments/hier_vq_cora_v5/`。
+
+**产物（层次模式）：** `codebook_coarse.npz` / `codebook_fine.npz` / `node_codes_coarse.npz` / `node_codes_fine.npz`；兼容字段 `codebook_embeddings.npz` = fine，`node_codes.npz` = fine。  
+**核心文件：** `models/hierarchical_encoder.py`（`HierarchicalGCN` + `DualChannelAgg`）。  
+**开关默认关：** 不加 `--hierarchical_vq` 时行为与旧 E1 一致。  
+**限制：** SAGE + hierarchical 暂不支持。
+
+### 17.1 动机与现状瓶颈
+
+**灾难链（现 E1 单码本）：**
+
+```text
+GNN 邻居一律平滑 → h 像邻居 → VQ 同码 <S_k>
+→ 边重建 Â ≈ z·zᵀ（越像越该有边）强化同配
+→ TF-IDF / P_code / 行内 <S_k> 重复强化
+→ 异配节点被当成「和邻居一类」；LLM 主要靠 8 个 text token
+```
+
+**现状代码（`models.py`）：** 单 `GraphConv` → 单 VQ → `decoder_1/2` + `z@z.T` 全图边 MSE；**不区分同配/异配**。  
+训练时赋码 = 相似度 argmax；训练结束存 `node_codes.npz`；preprocess 再跑一遍 `_infer_distances` 多为重复（可直接读存盘码）。
+
+### 17.2 从 HeteroGen 借 / 不借
+
+| 借 | 不借 |
+|----|------|
+| \(h=[h_L\|h_{\bar L}]\) 解耦 | 扩散生成 \(L_P\) / 整图生成 |
+| \(N^S\) / \(N^D\) 分路径聚合 | 粗码 = 类名进 prompt |
+| \(L_L\)（可选、小权重，只约束连续 \(h_L\)） | 细码走 P_code 改选词 |
+| \(L_D\)（dCov 解耦） | 必须用 y 分邻居（可用 proxy） |
+| \(L_M\)（结构通道影响平衡，可选） | |
+| \(L_H\)（同配/异配边重建平衡，**P1 优先**） | |
+
+原版 VQGraph Tokenizer：`L_Rec + L_CE + L_VQ + L_commit`。  
+本方案：`L_Rec/commit` 拆粗细两套；`L_CE` → 可选弱 \(L_L\) 或去掉；最终分类 CE 在 QLoRA。
+
+### 17.3 分工一览
+
+| 线 | 连续表示 | 离散码 | 含义 | 主要约束 |
+|----|----------|--------|------|----------|
+| 语义/主题 | \(h_L\) | **粗码** \(c^{\mathrm{co}}\)，\(M_{\mathrm{co}}\approx16\) | 邻域 **theme** | SemanticVQ + text；**不用 y 指定码号** |
+| 结构 | \(h_{\bar L}\) | **细码** \(c^{\mathrm{fi}}\)，\(M_{\mathrm{fi}}\approx256\) | **结构角色** | 残差 VQ + 边重建；+ \(L_H\) |
+
+**硬原则：**
+
+1. 粗码 = theme，**不是** class name  
+2. 细码 = structure，**不**走 P_code 选词  
+3. 邻居行 **不写** struct（防同码 repetition）  
+4. 分类靠 center text + LLM；结构辅助  
+5. \(L_L\) 只约束 \(h_L\)，**不**约束 \(c_{\mathrm{co}}\)  
+6. 边重建 / \(L_H\) **只绑细码**；\(M_{\mathrm{co}}\gg\) 类数（防粗码坍成类 ID）
+
+### 17.4 数据流
+
+```text
+x_i, A, t_i
+  → 双通道 GNN（h_L ← 主要 N^S；h_L̄ ← N^S 低频 + N^D 高频/对比）
+  → 可选 Linear_head(h_L) → L_L（弱）
+  → SemanticVQ(h_L, t_i) → z_co, c_co     # 粗码 theme
+  → r = h_L̄ − stopgrad(z_co)
+  → VQ_fi(r) → z_fi, c_fi                   # 细码 structure（无 text）
+  → Dec_fi + 边重建(z_fi) + L_H
+  → 导出 → preprocess（theme 词 + struct 摘要）→ QLoRA
+```
+
+### 17.5 双通道 GNN（量化前，必做）
+
+**\(h_L\)（语义通道）：** 只聚合同组邻居 \(N^S\)（低频），异组不进入 —— 对应 HeteroGen 式 (10)。
+
+**\(h_{\bar L}\)（结构通道）：** \(N^S\) 低频平滑 + \(N^D\) 高频/对比（消息可含 \(-h_j\)）—— 对应式 (11)–(13)。
+
+| 配置 | 预期 |
+|------|------|
+| 只拆两个 VQ，GNN 仍普通 GraphConv | \(h_{\bar L}\) 已抹平，L_H 事后补课，效果弱 |
+| 双通道 + 层次 VQ + L_H | 异配缓解主路径 |
+
+**Proxy（无 y）：** 同组 = 粗码相同或 \(\mathrm{cos}(t_i,t_j)>\tau\)；异组 = 否则。
+
+### 17.6 粗码（Theme）
+
+| 项 | 内容 |
+|----|------|
+| 内部 | \(c_{\mathrm{co}}\) + \(z_{\mathrm{co}}\) |
+| 给 LLM | P_code_co / μ 的 **top 词**，禁止写类名 |
+| 损失 | \(L_{\mathrm{co\_commit}}\) + \(L_{\mathrm{co\_sem}}\) + 可选 \(L_{\mathrm{co\_node\_rec}}\) |
+| **禁止** | \(L_{\mathrm{co\_cls}}=\mathrm{CE}(c_{\mathrm{co}},y)\) |
+
+**与 \(h_L\) / \(L_L\) / \(y\)：** 粗码与 \(h_L\) **同输入链路**；\(L_L\) 塑形连续 \(h_L\)（有判别力）；粗码含义由 **text/theme** 定，**不是** \(y\) 的离散化。  
+防变类码：\(M_{\mathrm{co}}\gg\#\mathrm{class}\)、\(\lambda_L\) 小、无 \(L_{\mathrm{co\_cls}}\)、LLM 看词不看码号。
+
+### 17.7 细码（Structure）
+
+```text
+r = h_L̄ − stopgrad(z_co)
+z_fi, c_fi = VQ_fi(r)     # 不加 text
+```
+
+| 损失 | 作用 |
+|------|------|
+| \(L_{\mathrm{fi\_commit}}\) / \(L_{\mathrm{fi\_node\_rec}}\) | 量化稳定 + 还原 \(h_{\bar L}\) |
+| \(L_{\mathrm{fi\_edge\_rec}}\) | \(\hat A\) 由 \(z_{\mathrm{fi}}\) 建（替换混合 z 的 `z·zᵀ`） |
+| \(L_H\) | \((L_{\mathrm{inter}}-L_{\mathrm{intra}})^2\)，强迫异配边也重建好 |
+| \(L_{\mathrm{intra\_co}}\)（可选） | 同粗码相邻 → 细码拉开（自监督） |
+
+**边 Decode：** Phase1 仍可用线性 + 内积 + \(L_H\)（decode 结构不大改）。  
+Phase2 可选双 decoder：`MLP_intra` / `MLP_inter` 分别拟合同配/异配边（替换全图 `z·zᵀ`）。粗码不参与边 decoder。
+
+### 17.8 总损失
+
+**完整版：**
+
+\[
+\begin{aligned}
+L &= \lambda_{\mathrm{co},c} L_{\mathrm{co\_commit}} + \lambda_{\mathrm{co},s} L_{\mathrm{co\_sem}} + \lambda_{\mathrm{co},n} L_{\mathrm{co\_node\_rec}} \\
+&+ \lambda_{\mathrm{fi},c} L_{\mathrm{fi\_commit}} + \lambda_{\mathrm{fi},n} L_{\mathrm{fi\_node\_rec}} + \lambda_{\mathrm{fi},e} L_{\mathrm{fi\_edge\_rec}} \\
+&+ \lambda_H L_H + \lambda_D L_D + \lambda_M L_M + \lambda_L L_L \\
+&+ \lambda_{\mathrm{tok}} L_{\mathrm{token}} + \lambda_{\mathrm{ico}} L_{\mathrm{intra\_co}}
+\end{aligned}
+\]
+
+**Phase1 最小：** \(L_{\mathrm{co\_commit}}+L_{\mathrm{co\_sem}}+L_{\mathrm{fi\_*}}+ \lambda_H L_H + \lambda_D L_D\) + 双通道 GNN。
+
+| 权重 | 初值 | 说明 |
+|------|------|------|
+| commit / sem / edge | ~1 | |
+| node rec | 0.5~1 | 对齐 `lamb_node` |
+| **λ_H** | 0.1~1 | 从小扫 |
+| λ_D | 0.01~0.1 | |
+| λ_M | 0.1~0.5 | 可选 |
+| λ_L | ≤0.1 | 弱；只 \(h_L\) |
+| λ_tok | 0.05 | **仅粗码**；现有 E5b，可关 |
+| λ_ico | 0.1 | 可选，未实现 |
+
+**两项可选辅助损失释义：**
+
+| 损失 | 含义 | 代码 |
+|------|------|------|
+| \(L_{\mathrm{token}}\) | \(\mathrm{KL}(P_{\mathrm{target}}\|P_{\mathrm{pred}})\)：码向量预测词表分布，供 \(P_{\mathrm{code}}\) 选词 | ✅ `token_predictor.py` |
+| \(L_{\mathrm{intra\_co}}\) | 同粗码邻居的细码距离 margin：同 theme 仍要结构可分 | ❌ 未实现 |
+
+**实验配置：** A 纯自监督码本（无 \(L_L\)，proxy 分边） / B 弱 \(L_L\)（推荐） / C + `L_cls_full`（对齐原 L_CE ablation）。
+
+### 17.9 LLM 序列化（与码本配套）
+
+```text
+[theme: neural, learning, networks, optimization]
+[struct: center=F_42; hist=F_3:4, F_17:2, F_9:1]
+Center: Title: ... Abstract: ...
+Neighbor_1: ...   # 仅 text，无 struct
+Question: Predict the category of the center paper.
+```
+
+禁止 `[class: Neural_Networks]` 作粗码显示（除非负对照）。
+
+### 17.10 实施阶段与验收
+
+| Phase | 内容 | 状态 |
+|-------|------|------|
+| **P0** | 双通道 GNN + 层次 VQ | ✅ `hierarchical_encoder.py` |
+| **P1** | + \(L_H\) + \(L_D\) + 弱 \(L_L\) | ✅ 已接入训练损失 |
+| **P2** | 新 JSONL + QLoRA | ❌ 未做 |
+| **P3** | \(L_M\)、\(L_{\mathrm{intra\_co}}\)、双 decoder、SAGE | ❌ 未做 |
+
+**必测指标：** 异配边同细码率；同配边同细码率（别崩）；按异类邻居比例分桶；粗码–类 NMI（不应≈1）；LLM ablation（full / theme-only / struct-only / nocode / 旧格式）。
+
+### 17.11 改动落点
+
+| 文件 | 改什么 |
+|------|--------|
+| `models/hierarchical_encoder.py` | **新增** DualChannelAgg + HierarchicalGCN |
+| `models.py` | `Model` 支持 `hierarchical_vq` |
+| `models/codebook_trainer.py` | labels 传入、双码本产物、分项 loss 日志 |
+| `config.py` / `train_codebook.py` | CLI 与超参 |
+| `preprocess_data.py` / `node_representation.py` | theme+struct JSONL — **未做** |
+| `finetune_llm.py` | instruction 适配 — **未做** |
+
+### 17.12 一句话收束
+
+粗码对 \(h_L\) 做 text 对齐 SemanticVQ（theme）；细码对结构残差 VQ，边重建绑 \(z_{\mathrm{fi}}\) 并用 \(L_H\) 打同配偏置；HeteroGen 贡献解耦通道 + 分路径聚合 + 异配边正则，**不**贡献扩散生成，**不**把粗码变成类标签。
